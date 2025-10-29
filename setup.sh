@@ -17,25 +17,6 @@ sudo apt update && echo "✔ Package lists updated successfully."
 echo "==> Upgrading system packages to the latest versions..."
 sudo apt upgrade -y && echo "✔ System packages upgraded successfully."
 
-# WORKAROUND: Install Python version 3.9
-# Necessary because the inky pip package depends on a version of Rumba for which Python <3.11 is only supported
-# We can't use apt repository ppa:deadsnakes/ppa to install Python because we're on a Raspberry Pi
-# Can take an hour or so to install
-echo "==> Checking if Python 3.9 is already installed..."
-if python3.9 --version &>/dev/null; then
-    echo "✔ Python 3.9 is already installed."
-else
-    echo "==> Installing Python3.9..."
-    sudo apt-get install -y build-essential tk-dev libncurses5-dev libncursesw5-dev libreadline6-dev libdb5.3-dev libgdbm-dev libsqlite3-dev libssl-dev libbz2-dev libexpat1-dev liblzma-dev zlib1g-dev libffi-dev
-    wget https://www.python.org/ftp/python/3.9.19/Python-3.9.19.tgz
-    sudo tar zxf Python-3.9.19.tgz
-    cd Python-3.9.19 || exit 1
-    sudo ./configure --enable-optimizations
-    sudo make -j 4
-    sudo make altinstall
-    echo "✔ Python 3.9 installed successfully."
-fi
-
 echo "==> Installing required system dependencies..."
 sudo apt-get install python3-numpy git libopenjp2-7 libportaudio2 -y \
   && echo "✔ System dependencies installed successfully."
@@ -52,7 +33,7 @@ cd now-playing || exit
 install_path=$(pwd)
 
 echo "==> Setting up a Python virtual environment..."
-python3.9 -m venv --system-site-packages venv && echo "✔ Python virtual environment created."
+python3 -m venv --system-site-packages venv && echo "✔ Python virtual environment created."
 echo "Activating the virtual environment..."
 source "${install_path}/venv/bin/activate" && echo "✔ Virtual environment activated."
 

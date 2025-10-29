@@ -9,8 +9,8 @@ song, and displays the song information on an e-ink display.
 
 <table>
 <tr>
-<td><img src="resources-readme/example-image-1.jpeg" width="500px" alt="Example Image 1"/></td>
-<td><img src="resources-readme/example-image-2.jpeg" width="500px" alt="Example Image 2"/></td>
+<td><img src="resources/readme/example-image-1.jpeg" width="500px" alt="Example Image 1"/></td>
+<td><img src="resources/readme/example-image-2.jpeg" width="500px" alt="Example Image 2"/></td>
 </tr>
 </table>
 
@@ -69,7 +69,9 @@ modularity, and extensibility.
 
 1. Flash Raspberry Pi OS Lite to your microSD card
    using [Raspberry Pi Imager](https://www.raspberrypi.com/documentation/computers/getting-started.html#installing-the-operating-system)
-2. Enable Wi-Fi and SSH (to allow remote access as the OS is headless) in the setup wizard
+2. In the setup wizard, enable:
+    - Wi-Fi
+    - SSH — to allow remote access, as the OS is headless
 
 ### 🔐 Required Credentials
 
@@ -77,12 +79,16 @@ modularity, and extensibility.
 
 1. Sign up at [OpenWeatherMap](https://openweathermap.org/)
 2. Generate your API key
-3. Safely store it
-4. Go to [Google Maps](https://www.google.com/maps) → Search your location → Right-click → Copy coordinates
+3. Store it, you will need it later
+
+#### 📍Weather Coordinates
+
+1. Go to [Google Maps](https://www.google.com/maps) → Search your location → Right-click → Copy coordinates
+2. Store it, you will need it later
 
 #### 🎵 Spotify API
 
-1. Go to [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)
+1. Go to the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)
 2. Click 'Create App' and fill out the form:
     1. App name
     2. App description
@@ -90,15 +96,19 @@ modularity, and extensibility.
     4. Check 'Web API'
     5. Check the 'Terms of Service'
 3. Click on 'Save'
-4. Safely store your Client ID and Client Secret
-5. [Copy the Playlist ID](https://clients.caster.fm/knowledgebase/110/How-to-find-Spotify-playlist-ID.html#:~:text=To%20find%20the%20Spotify%20playlist,Link%22%20under%20the%20Share%20menu.&text=The%20playlist%20id%20is%20the,after%20playlist%2F%20as%20marked%20above.)
+4. Store your Client ID and Client Secret, you will need it later
+
+#### 🆔 Spotify Playlist ID
+
+1. [Copy the Playlist ID](https://clients.caster.fm/knowledgebase/110/How-to-find-Spotify-playlist-ID.html#:~:text=To%20find%20the%20Spotify%20playlist,Link%22%20under%20the%20Share%20menu.&text=The%20playlist%20id%20is%20the,after%20playlist%2F%20as%20marked%20above.)
    of the playlist you want your songs to be added to
+2. Store it, you will need it later
 
 #### 🎟 Spotify Access Token
 
 Since Raspberry Pi OS Lite is headless (no browser), you must authorize Spotify once from a computer:
 
-1. On your PC or Mac, clone this repo:
+1. On your computer, clone this repo:
 
 ```bash 
   git clone https://github.com/maurocastermans/now-playing
@@ -106,7 +116,7 @@ Since Raspberry Pi OS Lite is headless (no browser), you must authorize Spotify 
 ```
 
 2. Fill in your `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` in `spotify_auth_helper.py`
-3. Run:
+3. Run the script:
 
 ```bash
   python3 spotify_auth_helper.py
@@ -117,9 +127,13 @@ Since Raspberry Pi OS Lite is headless (no browser), you must authorize Spotify 
 
 ### ⚙️ Installation Script
 
-#### 📥 Download and Run
+SSH into your Raspberry Pi:
 
-SSH into your Raspberry Pi and run:
+```bash
+  ssh <username>@<ip-address>
+```
+
+And run:
 
 ```bash
   wget https://raw.githubusercontent.com/maurocastermans/now-playing/main/setup.sh
@@ -127,51 +141,59 @@ SSH into your Raspberry Pi and run:
   bash ./setup.sh
 ```
 
-Afterwards, copy the .cache file from your local computer to the now-playing project root. Spotipy will refresh the token automatically using
-the stored refresh token—no need to do this again (unless you change accounts).
+Afterwards, copy the .cache file from your local computer to the now-playing project root. Spotipy will from now on
+automatically refresh the
+access token when it expires (using the refresh token present in the .cache file)
 
-Should you encounter any errors or issues after installation, check [Known Issues](#-known-issues)
+The `setup.sh` script will automatically start the now-playing systemd service. Verify that the service starts without
+errors:
 
-#### 🧙 What the Script Does
-
-- Enables SPI and I2C
-- Updates the system and installs dependencies
-- Sets up a Python virtual environment and installs Python packages
-- Creates config, log, and resources directories
-- Prompts for credentials, your e-ink display size and generates config.yaml
-- Copies and configures a systemd service to autostart on boot
-- Starts the now-playing service
-
-#### 📂 Resulting Config
-
-```yaml
-display:
-  width: 600 # or 640 (4"), or 800 (7.3")
-  height: 448 # or 400 (4"), or 480 (7.3")
-  small_album_cover: true
-  small_album_cover_px: 250 # or 200 (4"), or 300 (7.3")
-  screensaver_image: "resources/default.jpg"
-  font_path: "resources/CircularStd-Bold.otf"
-  font_size_title: 45
-  font_size_subtitle: 35
-  offset_left_px: 20
-  offset_right_px: 20
-  offset_top_px: 0
-  offset_bottom_px: 20
-  offset_text_shadow_px: 4
-
-weather:
-  openweathermap_api_key: "YOUR_API_KEY"
-  geo_coordinates: "LAT,LON"
-
-spotify:
-  client_id: "YOUR_SPOTIFY_CLIENT_ID"
-  client_secret: "YOUR_SPOTIFY_CLIENT_SECRET"
-  playlist_id: "YOUR_SPOTIFY_PLAYLIST_ID"
-
-log:
-  log_file_path: "log/now_playing.log"
+```bash
+  journalctl -u now-playing.service --follow
 ```
+
+Should you encounter any errors, check [Known Issues](#-known-issues)
+
+> 🧙 <b>What the Script Does</b>
+>
+> - Enables SPI and I2C
+> - Updates the system and installs dependencies
+> - Sets up a Python virtual environment and installs Python packages
+> - Creates config, log, and resources directories
+> - Prompts for credentials, your e-ink display size and generates config.yaml
+> - Copies and configures a systemd service to autostart on boot
+> - Starts the now-playing service
+
+> 📂 <b>Resulting Config</b>
+>
+> ```yaml
+> display:
+>   width: 600 # or 640 (4"), or 800 (7.3")
+>   height: 448 # or 400 (4"), or 480 (7.3")
+>   small_album_cover: true
+>   small_album_cover_px: 250 # or 200 (4"), or 300 (7.3")
+>   screensaver_image: "resources/default.jpg"
+>   font_path: "resources/CircularStd-Bold.otf"
+>   font_size_title: 45
+>   font_size_subtitle: 35
+>   offset_left_px: 20
+>   offset_right_px: 20
+>   offset_top_px: 0
+>   offset_bottom_px: 20
+>   offset_text_shadow_px: 4
+> 
+> weather:
+>   openweathermap_api_key: "YOUR_API_KEY"
+>   geo_coordinates: "LAT,LON"
+> 
+> spotify:
+>   client_id: "YOUR_SPOTIFY_CLIENT_ID"
+>   client_secret: "YOUR_SPOTIFY_CLIENT_SECRET"
+>   playlist_id: "YOUR_SPOTIFY_PLAYLIST_ID"
+> 
+> log:
+>   log_file_path: "log/now_playing.log"
+> ```
 
 ## 🛠 Useful Commands
 
@@ -215,7 +237,7 @@ After editing, restart the service to apply changes:
 
 ### 🧪 Manual Python Execution
 
-Now-playing runs in a Python virtual environment (using venv). If you want to run Python code manually:
+Now-playing runs in a Python virtual environment (using venv). If you want to run the Python code manually:
 
 ```bash
   sudo systemctl stop now-playing.service

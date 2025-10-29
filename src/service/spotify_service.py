@@ -17,7 +17,7 @@ class SpotifyService:
         self.sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
             client_id=self._config['spotify']['client_id'],
             client_secret=self._config['spotify']['client_secret'],
-            redirect_uri="http://localhost:8888/callback",
+            redirect_uri="http://127.0.0.1:8888/callback",
             scope="playlist-modify-public playlist-modify-private",
             open_browser=False  # Important for headless mode
         ))
