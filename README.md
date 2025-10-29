@@ -92,7 +92,7 @@ modularity, and extensibility.
 2. Click 'Create App' and fill out the form:
     1. App name
     2. App description
-    3. Redirect URI = http://localhost:8888/callback
+    3. Redirect URI = http://127.0.0.1:8888/callback
     4. Check 'Web API'
     5. Check the 'Terms of Service'
 3. Click on 'Save'
