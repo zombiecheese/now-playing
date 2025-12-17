@@ -27,7 +27,7 @@ if [ -d "now-playing" ]; then
 fi
 
 echo "==> Cloning the now-playing project from GitHub..."
-git clone https://github.com/maurocastermans/now-playing && echo "✔ Project cloned successfully."
+git clone https://github.com/zombiecheese/now-playing && echo "✔ Project cloned successfully."
 echo "Switching to the installation directory."
 cd now-playing || exit
 install_path=$(pwd)
@@ -71,6 +71,9 @@ read -r spotify_client_secret
 echo "Please enter your Spotify playlist ID:"
 read -r spotify_playlist_id
 
+echo "Enter your OpenAI api key:"
+read -r openai_api_key
+
 echo "==> Setting up the configuration in config.yaml..."
 echo "Select your Inky Impression display size:"
 echo "1) 4.0 inch"
@@ -102,13 +105,33 @@ case $display_size_choice in
     ;;
 esac
 
+echo "Select your Inky Impression display orientation:"
+echo "1) portrait"
+echo "2) landscape"
+read -r -p "Enter choice (1/2/3): " display_size_choice
+
+
+case $display_size_choice in
+  1)
+    orientation=portrait
+    ;;
+  2)
+    orientation=landscape
+    ;;
+  *)
+    echo "Invalid choice. Defaulting to portrait."
+    orientation=portrait
+    ;;
+esac
+
+
 cat <<EOF > "${install_path}/config/config.yaml"
 display:
+  # Physical hardware buffer for your Inky device
   width: $display_width
   height: $display_height
-  small_album_cover: true
-  small_album_cover_px: $album_cover_size
-  screensaver_image: "${install_path}/resources/default.jpg"
+
+  # Fonts & layout
   font_path: "${install_path}/resources/CircularStd-Bold.otf"
   font_size_title: 45
   font_size_subtitle: 35
@@ -118,17 +141,65 @@ display:
   offset_bottom_px: 20
   offset_text_shadow_px: 4
 
+  # Album Backdrop image styling
+  backdrop_blur_radius: 12
+  backdrop_darken_alpha: 120 
+  backdrop_use_gradient: false
+  small_album_cover_px: 480
+
+  # Weather mode background (full-screen fit, orientation-aware, same location at ai generation)
+  weather_background_image: "${install_path}/resources/ai_screensaver.png"
+
+  # Global orientation (fallback if mode-specific values are not set)
+  orientation: $orientation           # "portrait" or "landscape"
+  
+  # Rotation to align the portrait canvas to your hardware buffer
+  # Change to 270 if your panel is mounted the other way.
+  portrait_rotate_degrees: 90
+  
+  # Background fill behind square album art in portrait playing mode
+  portrait_album_background_color: "black"
+
+  # Text alignment per orientation
+  # Valid values: "left" | "center" | "right"
+  text_alignment_portrait: "center"
+  text_alignment_landscape: "left"
+
+  # Text wrapping options
+  text_wrap_break_long_words: true   # break very long words if needed
+  text_wrap_hyphenate: false         # add a hyphen at wrap if it fitss
+  text_line_spacing_px: 4            # extra spacing between wrapped lines
+
 weather:
   openweathermap_api_key: "${openweathermap_api_key}"
   geo_coordinates: "${geo_coordinates}"
+  background_refresh_seconds: 900
 
 spotify:
   client_id: "${spotify_client_id}"
   client_secret: "${spotify_client_secret}"
   playlist_id: ${spotify_playlist_id}
 
+orchestrator:
+  debounce_seconds: 30          # skip re-render if same track detected again within N seconds
+  cache_ttl_seconds: 86400      # keep album/year enrichment in cache for 1 day
+  cache_size: 512               # max enrichment entries
+  cache_file_path: "${install_path}/cache/enrichment_cache.json"  # optional; omit to disable disk persistence
+
+openai:
+  api_key: $openai_api_key
+  prompt_style: "80s anime" # enter image style type (default is 80s anime)
+
+  # If image generation fails - fallback to these options (day night aware)
+  fallback_image_path_day: "${install_path}/resources/default_day.png" 
+  fallback_image_path_night: "${install_path}/resources/default_night.png" 
+  fallback_image_path: "${install_path}/resources/default.jpg"
+
+audio:
+  recording_duration_seconds: 5 # Total duration to record for music detection/identification (max 10)
+
 log:
-  log_file_path: "${install_path}/log/now_playing.log"
+  log_file_path: "${install_path}/log/now_playing.log" 
 
 EOF
 echo "✔ Configuration file created at ${install_path}/config/config.yaml."

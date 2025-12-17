@@ -2,7 +2,7 @@ pillow
 requests
 scipy
 sounddevice
-numpy
+numpy<2
 shazamio
 librosa
 inky
@@ -10,3 +10,5 @@ tflite-runtime
 typing
 pyyaml
 spotipy
+openai
+astral>=2.2

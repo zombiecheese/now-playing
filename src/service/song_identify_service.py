@@ -1,6 +1,7 @@
+
 import asyncio
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
 import io
 from shazamio import Shazam
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ class SongInfo:
     artist: Optional[str]
     album: Optional[str]
     album_art: Optional[str]
+    release_year: Optional[str] = None
 
 
 class SongIdentifyService:
@@ -42,7 +44,8 @@ class SongIdentifyService:
             title=track.get('title', None),
             artist=track.get('subtitle', None),
             album=SongIdentifyService._extract_album_name(track),
-            album_art=track.get('images', {}).get('coverart', None)
+            album_art=track.get('images', {}).get('coverart', None),
+            release_year=SongIdentifyService._extract_release_year(track)
         )
 
     @staticmethod
@@ -52,3 +55,19 @@ class SongIdentifyService:
             if item.get('title') == 'Album':
                 return item.get('text', None)
         return None
+
+    @staticmethod
+    def _extract_release_year(track: Dict) -> Optional[str]:
+        metadata = track.get('sections', [{}])[0].get('metadata', [])
+        for item in metadata:
+            if item.get('title') in ('Released', 'Release Date'):
+                text = (item.get('text') or "").strip()
+                parts = text.split('-')
+                year = parts[0].strip() if parts else None
+                if year and year.isdigit() and len(year) == 4:
+                    return year
+                tokens = text.replace(',', ' ').split()
+                for tok in reversed(tokens):
+                    if tok.isdigit() and len(tok) == 4:
+                        return tok
+       
