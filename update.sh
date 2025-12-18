@@ -18,7 +18,7 @@ if [ -d "now-playing" ]; then
   git remote add origin https://github.com/zombiecheese/now-playing
   git fetch origin
   git reset --hard origin/main
-  cd now-playing || exit
+  exit
   #install_path=$(pwd)
   #source "${install_path}/venv/bin/activate" && echo "✔ Virtual environment activated."
   #echo "==> upgrading required Python packages..."
