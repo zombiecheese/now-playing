@@ -108,8 +108,9 @@ esac
 echo "Select your Inky Impression display orientation:"
 echo "1) portrait"
 echo "2) landscape"
-read -r -p "Enter choice (1/2/3): " display_size_choice
 
+
+read -r -p "Enter choice (1/2/3): " display_size_choice
 
 case $display_size_choice in
   1)
