@@ -20,11 +20,12 @@ if [ -d "now-playing" ]; then
   git fetch origin
   git reset --hard origin/main
   
-
-  #install_path=$(pwd)
-  #source "${install_path}/venv/bin/activate" && echo "✔ Virtual environment activated."
-  #echo "==> upgrading required Python packages..."
-  #pip3 install -r requirements.txt --upgrade && echo "✔ Python packages installed successfully."
+  install_path=$(pwd)
+  source "${install_path}/venv/bin/activate" && echo "✔ Virtual environment activated."
+  echo "==> upgrading required Python packages..."
+  pip3 install -r requirements.txt --upgrade && echo "✔ Python packages installed successfully."
+  echo "Dectivating the virtual environment..."
+  source "${install_path}/venv/bin/deactivate" && echo "✔ Virtual environment activated."
 fi
 
 echo "==> run systemctl start now-playing"
