@@ -7,6 +7,8 @@ import shutil
 from typing import Optional, Tuple
 
 import requests  # for city name & weather description when needed
+import traceback
+import json
 
 from logger import Logger
 from config import Config
@@ -745,13 +747,69 @@ class AIBackgroundService:
                     )
                 except Exception:
                     pass
+
+                # Make the request
                 result = self._client.images.generate(
                     model=self._image_model,
                     prompt=prompt,
                     size=size,
                 )
-                image_base64 = getattr(result.data[0], "b64_json", None)
+
+                # Try to extract the base64 payload from common response shapes
+                image_base64 = None
+                try:
+                    # Some SDKs store result.data as a list-like object
+                    data0 = None
+                    try:
+                        data0 = result.data[0]
+                    except Exception:
+                        data0 = None
+
+                    if data0 is not None:
+                        image_base64 = getattr(data0, "b64_json", None) or getattr(data0, "b64", None) or getattr(data0, "base64", None)
+                    # Defensive: some SDKs may return a dict-like payload
+                    if not image_base64 and isinstance(result, (dict,)):
+                        # attempt to find an obvious key
+                        for k in ("b64_json", "b64", "base64", "data"):
+                            v = result.get(k)
+                            if isinstance(v, str) and v:
+                                image_base64 = v
+                                break
+                except Exception:
+                    image_base64 = None
+
+                # Log a compact summary of the response to help diagnose why no image was produced
                 if not image_base64:
+                    try:
+                        # Build a safe, truncated summary of the result object
+                        try:
+                            if hasattr(result, "__dict__"):
+                                res_summary = json.dumps({k: v for k, v in result.__dict__.items() if k != "data"}, default=str)
+                            else:
+                                res_summary = str(result)
+                        except Exception:
+                            res_summary = str(result)
+                        if len(res_summary) > 800:
+                            res_summary = res_summary[:800] + "..."
+
+                        self._logger.error(
+                            "OpenAI returned no image payload. model=%s size=%s city=%s weather=%s prompt_len=%d model_info=%s image_size=%s result_summary=%s",
+                            self._image_model,
+                            size,
+                            getattr(self, "_city", None),
+                            getattr(self, "_weather_desc", None),
+                            len(prompt) if prompt else 0,
+                            getattr(self, "_model_info", None),
+                            getattr(self, "_image_size", None),
+                            res_summary,
+                        )
+                    except Exception:
+                        # best-effort logging; continue to fallback
+                        try:
+                            self._logger.error("OpenAI returned no image payload and result could not be summarized.")
+                        except Exception:
+                            pass
+
                     self._logger.warning(
                         "OpenAI returned no image payload; applying fallback image."
                     )
@@ -759,7 +817,45 @@ class AIBackgroundService:
                         self._logger.warning("Fallback failed; keeping previous background.")
                     return
             except Exception as gen_err:
-                self._logger.error(f"Image generation error: {gen_err}", exc_info=True)
+                # Log contextual info first (without secrets)
+                try:
+                    self._logger.error(
+                        "Image generation failed: model=%s size=%s city=%s weather=%s prompt_len=%d model_info=%s image_size=%s",
+                        self._image_model,
+                        size,
+                        getattr(self, "_city", None),
+                        getattr(self, "_weather_desc", None),
+                        len(prompt) if prompt else 0,
+                        getattr(self, "_model_info", None),
+                        getattr(self, "_image_size", None),
+                    )
+                except Exception:
+                    pass
+
+                # Exception details and truncated traceback
+                try:
+                    tb = traceback.format_exc()
+                    if tb and len(tb) > 2000:
+                        tb = tb[:2000] + "..."
+                    self._logger.error("Image generation exception: %s", str(gen_err))
+                    self._logger.debug("Image generation traceback (truncated): %s", tb)
+                except Exception:
+                    try:
+                        self._logger.error(f"Image generation error: {gen_err}", exc_info=True)
+                    except Exception:
+                        pass
+
+                # If the exception carries an HTTP/response body, try to log a truncated version
+                try:
+                    err_body = getattr(gen_err, "response", None) or getattr(gen_err, "body", None) or getattr(gen_err, "http_body", None)
+                    if err_body:
+                        s = str(err_body)
+                        if len(s) > 1000:
+                            s = s[:1000] + "..."
+                        self._logger.debug("Image generation exception response/body (truncated): %s", s)
+                except Exception:
+                    pass
+
                 if not self._apply_fallback_image():
                     self._logger.warning(
                         "Fallback failed after generation error; keeping previous background."
