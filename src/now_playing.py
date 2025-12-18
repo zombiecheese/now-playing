@@ -86,11 +86,6 @@ class NowPlaying:
 
         import inspect
 
-        # Show the class and where it was loaded from
-        self._logger.debug("AIBackgroundService type: %s", type(self._ai_bg))
-        self._logger.debug("AIBackgroundService module: %s", self._ai_bg.__class__.__module__)
-        self._logger.debug("AIBackgroundService file: %s", inspect.getfile(self._ai_bg.__class__))
-
         # Confirm the method exists on the instance
         self._logger.debug(
             "Has refresh_background_if_needed: %s",

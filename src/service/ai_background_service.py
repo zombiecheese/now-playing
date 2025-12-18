@@ -115,6 +115,17 @@ class AIBackgroundService:
                 self._client = OpenAI(api_key=self._api_key)
             except Exception as e:
                 self._logger.error(f"Failed to initialize OpenAI client: {e}")
+        # Log OpenAI-related configuration (do NOT log API key)
+        try:
+            self._logger.debug(
+                "OpenAI configuration: model=%s, client_initialized=%s, max_image_dimension=%s, max_square_size=%s",
+                self._image_model,
+                bool(self._client),
+                self._max_image_dimension,
+                self._max_square_size,
+            )
+        except Exception:
+            pass
 
         # optional timezone fallback from config (e.g., "Europe/London") used when OpenWeather fails
         self._timezone_fallback = (self._config.get("weather", {}) or {}).get("timezone")
@@ -172,7 +183,8 @@ class AIBackgroundService:
             return self._astro_text
 
         if not self._coords_ok:
-            return "Include the current sun/moon position in the sky appropriate for the local time."
+            local_time = self._get_local_time_str()
+            return f"Include the current sun/moon position in the sky appropriate for ({local_time})."
 
         now_utc = datetime.datetime.now(datetime.timezone.utc)
 
@@ -211,9 +223,72 @@ class AIBackgroundService:
                 return self._astro_text
             except Exception as e:
                 self._logger.debug(f"Astral calculation failed: {type(e).__name__}: {e}")
-                return "Include the current sun/moon position in the sky appropriate for the local time."
+                local_time = self._get_local_time_str()
+                return f"Include the current sun/moon position in the sky appropriate for ({local_time})."
         else:
-            return "Include the current sun/moon position in the sky appropriate for the local time."
+            local_time = self._get_local_time_str()
+            return f"Include the current sun/moon position in the sky appropriate for ({local_time})."
+
+    def _get_local_time_str(self) -> str:
+        """
+        Return a human-friendly local time string determined from available timezone info.
+        Priority:
+         1. OpenWeather `timezone` offset (seconds) from cached weather raw payload
+         2. `self._timezone_fallback` using `zoneinfo.ZoneInfo` if available
+         3. System local time as fallback
+        """
+        try:
+            # Ensure weather cache is present if possible
+            if not self._weather_cache:
+                try:
+                    self._fetch_weather_data()
+                except Exception:
+                    pass
+
+            raw = (self._weather_cache or {}).get("raw") or {}
+            tz_offset = raw.get("timezone")
+            if tz_offset is not None:
+                try:
+                    offs = int(tz_offset)
+                    tz = datetime.timezone(datetime.timedelta(seconds=offs))
+                    local_dt = datetime.datetime.now(datetime.timezone.utc).astimezone(tz)
+                    res = local_dt.strftime("%Y-%m-%d %H:%M:%S %z")
+                    try:
+                        self._logger.debug("Local time computed using OpenWeather offset=%s: %s", tz_offset, res)
+                    except Exception:
+                        pass
+                    return res
+                except Exception:
+                    pass
+
+            if self._timezone_fallback and self._ZoneInfo:
+                try:
+                    tz = self._ZoneInfo(self._timezone_fallback)
+                    local_dt = datetime.datetime.now(tz)
+                    res = local_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+                    try:
+                        self._logger.debug("Local time computed using timezone fallback %s: %s", self._timezone_fallback, res)
+                    except Exception:
+                        pass
+                    return res
+                except Exception:
+                    pass
+
+            # Fallback to system local time
+            local_dt = datetime.datetime.now()
+            res = local_dt.strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                self._logger.debug("Local time computed using system local time: %s", res)
+            except Exception:
+                pass
+            return res
+        except Exception:
+            res = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                self._logger.debug("Local time computation failed; returning %s", res)
+            except Exception:
+                pass
+            return res
 
     # --- NEW: determine day/night (reusing OpenWeather first, fallback to local time)
     def _is_daytime(self) -> bool:
@@ -279,7 +354,15 @@ class AIBackgroundService:
         # Prefer specific paths when present
         candidate = self._fallback_image_path_day if is_day else self._fallback_image_path_night
         if candidate:
+            try:
+                self._logger.debug("Chosen fallback image (day=%s): %s", is_day, candidate)
+            except Exception:
+                pass
             return candidate
+        try:
+            self._logger.debug("Using legacy fallback image path: %s", self._fallback_image_path)
+        except Exception:
+            pass
         return self._fallback_image_path  # may be empty
 
     def _lighting_instructions(self) -> str:
@@ -477,6 +560,17 @@ class AIBackgroundService:
             desc = (data.get("weather", [{}])[0].get("description") or "").strip().capitalize()
             sys_info = data.get("sys", {}) or {}
             self._weather_cache = {"city": city, "weather_desc": desc or "current local conditions", "sys": sys_info, "raw": data}
+            # Log fetched weather details for debugging
+            try:
+                self._logger.info(
+                    "Fetched weather: city=%s, desc=%s, sunrise=%s, sunset=%s",
+                    city,
+                    desc or "current local conditions",
+                    sys_info.get("sunrise"),
+                    sys_info.get("sunset"),
+                )
+            except Exception:
+                pass
             return self._weather_cache
         except Exception as e:
             self._logger.debug(f"OpenWeather fetch failed: {type(e).__name__}: {e}")
@@ -547,6 +641,20 @@ class AIBackgroundService:
         except Exception:
             self._model_info = None
             self._image_size = None
+        # Log prepared context (weather/time/OpenAI-related) for diagnostics
+        try:
+            self._logger.info(
+                "Prepared context: city=%s, weather=%s, astro=%s, lighting=%s, model=%s, model_info=%s, image_size=%s",
+                getattr(self, "_city", None),
+                getattr(self, "_weather_desc", None),
+                getattr(self, "_astro_text", None),
+                getattr(self, "_lighting_text", None),
+                getattr(self, "_image_model", None),
+                getattr(self, "_model_info", None),
+                getattr(self, "_image_size", None),
+            )
+        except Exception:
+            pass
 
     # --- build the final prompt string
     def _build_dynamic_prompt(self) -> str:
@@ -594,6 +702,16 @@ class AIBackgroundService:
             self._logger.debug("OpenAI image prompt: %s", prompt)
             self._logger.debug("Image generation model=%s size=%s", self._image_model, size)
             try:
+                try:
+                    self._logger.info(
+                        "Generating image with model=%s size=%s city=%s weather=%s",
+                        self._image_model,
+                        size,
+                        getattr(self, "_city", None),
+                        getattr(self, "_weather_desc", None),
+                    )
+                except Exception:
+                    pass
                 result = self._client.images.generate(
                     model=self._image_model,
                     prompt=prompt,
