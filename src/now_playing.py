@@ -4,7 +4,7 @@ import sys
 import numpy as np
 import traceback
 import signal
-from typing import Tuple, Final
+from typing import Tuple, Final, Optional
 import gpiod
 import gpiodevice
 from gpiod.line import Bias, Direction, Edge
@@ -83,6 +83,8 @@ class NowPlaying:
 
         # NEW: OpenAI background generator (uses weather.background_refresh_seconds from config)
         self._ai_bg: AIBackgroundService = AIBackgroundService()
+        # When True: force using AI background fallback images (no generation)
+        self._ai_bg_fallback_mode: bool = False
 
         import inspect
 
@@ -162,12 +164,15 @@ class NowPlaying:
         1) Opportunistically refresh the AI background image if its TTL has expired.
         2) If screensaver should be shown/updated (first time or stale), fetch weather and render.
         """
-        # (1) Try generating a fresh AI background image (if needed & API key configured).
-        try:
-            self._ai_bg.refresh_background_if_needed()
-        except Exception as e:
-            # Non-fatal: we still proceed with weather rendering
-            self._logger.warning(f"AI background refresh skipped: {e}")
+        # (1) Optionally generate a fresh AI background image (if not forcing fallback).
+        if not self._ai_bg_fallback_mode:
+            try:
+                self._ai_bg.refresh_background_if_needed()
+            except Exception as e:
+                # Non-fatal: we still proceed with weather rendering
+                self._logger.warning(f"AI background refresh skipped: {e}")
+        else:
+            self._logger.info("AI background generation is currently forced off; using fallbacks.")
 
         # (2) Decide whether to (re)render screensaver with up-to-date weather info
         if (
@@ -175,13 +180,24 @@ class NowPlaying:
             and self._state_manager.no_music_detected_for_more_than_a_minute()
         ) or self._state_manager.screensaver_still_up_but_weather_info_outdated():
             weather_info = self._weather_service.get_weather_info()
-            self._set_screensaver_state_and_update_display(weather_info)
+            # Determine whether to force a time-relevant fallback image and show the indicator dot
+            fallback_path = None
+            show_dot = False
+            try:
+                if self._ai_bg_fallback_mode:
+                    fallback_path = self._ai_bg.get_fallback_path()
+                    if fallback_path:
+                        show_dot = True
+            except Exception:
+                fallback_path = None
+            self._set_screensaver_state_and_update_display(weather_info, show_ai_dot=show_dot, fallback_image_path=fallback_path)
 
-    def _set_screensaver_state_and_update_display(self, weather_info: WeatherInfo) -> None:
+    def _set_screensaver_state_and_update_display(self, weather_info: WeatherInfo, show_ai_dot: bool = False, fallback_image_path: Optional[str] = None) -> None:
         if self._state_manager.should_clean_display():
             self._clean_display_and_set_clean_state()
         self._state_manager.set_screensaver_state(weather_info)
-        self._display_service.update_display_to_screensaver(weather_info)
+        # Pass through whether to render the small red dot and an optional fallback image override
+        self._display_service.update_display_to_screensaver(weather_info, show_ai_dot=show_ai_dot, fallback_image_path=fallback_image_path)
         self._state_manager.increase_image_counter()
 
     # --- Buttons & housekeeping ---
@@ -208,6 +224,8 @@ class NowPlaying:
                     self._logger.debug(f"Button {button_label} pressed")
                     if button_label == "A":
                         self._handle_button_a()
+                    elif button_label == "B":
+                        self._handle_button_b()
 
         threading.Thread(target=listen, daemon=True).start()
 
@@ -223,6 +241,39 @@ class NowPlaying:
                 self._spotify_service.add_to_playlist(track_uri)
         except Exception as e:
             self._logger.error(f"Error occurred: {e}")
+            self._logger.error(traceback.format_exc())
+
+    def _handle_button_b(self) -> None:
+        """Toggle AI background generation fallback mode (force using time-relevant fallbacks).
+
+        When enabled we skip generation and use the configured time-relevant fallback image.
+        A small red dot will be shown on the screensaver when the fallback image is available.
+        """
+        try:
+            self._ai_bg_fallback_mode = not self._ai_bg_fallback_mode
+            self._logger.info(f"AI background fallback mode toggled to: {self._ai_bg_fallback_mode}")
+
+            # Immediately update screensaver to reflect the new mode (if screensaver active or eligible)
+            if (
+                self._state_manager.get_state().current == DisplayState.SCREENSAVER
+                or self._state_manager.no_music_detected_for_more_than_a_minute()
+            ):
+                weather_info = self._weather_service.get_weather_info()
+                # Decide fallback path and dot visibility
+                fallback_path = None
+                show_dot = False
+                try:
+                    if self._ai_bg_fallback_mode:
+                        fallback_path = self._ai_bg.get_fallback_path()
+                        if fallback_path:
+                            show_dot = True
+                except Exception:
+                    fallback_path = None
+
+                # Update display immediately
+                self._set_screensaver_state_and_update_display(weather_info, show_ai_dot=show_dot, fallback_image_path=fallback_path)
+        except Exception as e:
+            self._logger.error(f"Error toggling AI background fallback mode: {e}")
             self._logger.error(traceback.format_exc())
 
 

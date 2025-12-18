@@ -154,22 +154,24 @@ class DisplayService:
             meta=album_meta,
             artist_backdrop=artist_backdrop_img,
         )
-        self._show_image_on_display(display_image)
+        self._show_image_on_display(display_image, show_ai_dot=False)
 
 
 
-    def update_display_to_screensaver(self, weather_info: WeatherInfo) -> None:
+    def update_display_to_screensaver(self, weather_info: WeatherInfo, show_ai_dot: bool = False, fallback_image_path: Optional[str] = None) -> None:
         """
         Render screensaver/weather screen.
         """
     # Background image (file) with fallback
 
-        if self._weather_bg_path:
+        # If a specific fallback path override was provided (e.g., time-relevant AI fallback), prefer it
+        chosen_path = fallback_image_path or self._weather_bg_path
+        if chosen_path:
             try:
-                bg_image = Image.open(self._weather_bg_path).convert("RGBA")
+                bg_image = Image.open(chosen_path).convert("RGBA")
             except Exception as e:
                 self._logger.error(
-                    f"Failed to load weather background '{self._weather_bg_path}': {e}"
+                    f"Failed to load weather background '{chosen_path}': {e}"
                 )
                 bg_image = self._make_fallback_background().convert("RGBA")
         else:
@@ -198,7 +200,7 @@ class DisplayService:
             mode="weather",
             meta=meta,
         )
-        self._show_image_on_display(display_image)
+        self._show_image_on_display(display_image, show_ai_dot=show_ai_dot)
 
 
     # ---------------------------------------------------------------------
@@ -581,9 +583,26 @@ class DisplayService:
     # Display output
     # ---------------------------------------------------------------------
 
-    def _show_image_on_display(self, image: Image.Image, saturation: float = 0.5) -> None:
+    def _show_image_on_display(self, image: Image.Image, saturation: float = 0.5, show_ai_dot: bool = False) -> None:
         try:
             image = self._finalize_for_hardware(image)
+
+            # Optionally draw a small red indicator at the hardware top-left
+            if show_ai_dot:
+                try:
+                    draw = ImageDraw.Draw(image)
+                    # small, clearly visible dot with a modest margin
+                    margin = max(4, min(image.size) // 64)
+                    radius = max(3, min(image.size) // 80)
+                    x0 = margin
+                    y0 = margin
+                    x1 = x0 + (radius * 2)
+                    y1 = y0 + (radius * 2)
+                    draw.ellipse((x0, y0, x1, y1), fill=(255, 0, 0))
+                except Exception:
+                    # Non-fatal drawing error; continue to display image
+                    pass
+
             self._inky.set_image(image, saturation=saturation)
             self._inky.show()
         except Exception as e:

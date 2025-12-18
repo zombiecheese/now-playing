@@ -365,6 +365,16 @@ class AIBackgroundService:
             pass
         return self._fallback_image_path  # may be empty
 
+    def get_fallback_path(self) -> str:
+        """Public accessor for the time-relevant fallback image path.
+
+        Returns an empty string when no fallback path is configured.
+        """
+        try:
+            return self._choose_fallback_path()
+        except Exception:
+            return ""
+
     def _lighting_instructions(self) -> str:
         # If prepared context already set lighting text, return it to avoid recomputation
         if self._lighting_text:
