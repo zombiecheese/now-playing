@@ -14,15 +14,16 @@ if [ -d "now-playing" ]; then
   echo "==> fetching updated code from git"
   cd now-playing 
   git init
+  git remote remove origin
   git remote add origin https://github.com/zombiecheese/now-playing
   git fetch origin
-  git reset --hard origin/master
+  git reset --hard origin/main
   cd now-playing || exit
   install_path=$(pwd)
   source "${install_path}/venv/bin/activate" && echo "✔ Virtual environment activated."
   echo "==> upgrading required Python packages..."
   pip3 install -r requirements.txt --upgrade && echo "✔ Python packages installed successfully."
 fi
-
+cd ..
 echo "==> run systemctl start now-playing"
 echo "🎉 Update is complete! Your now-playing display is configured."
