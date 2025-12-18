@@ -617,21 +617,26 @@ class AIBackgroundService:
         cfg_map = self._model_image_settings or {}
         cfg = cfg_map.get(model, {}) or {}
 
+        # Normalize legacy/ambiguous model names: map `dall-e` -> `dall-e-2` (only DALL·E-2/3 supported)
+        try:
+            if model in ("dall-e", "dalle"):
+                try:
+                    self._logger.warning("Legacy model name '%s' detected; treating as 'dall-e-2'.", model)
+                except Exception:
+                    pass
+                model = "dall-e-2"
+        except Exception:
+            pass
+
         # Only `gpt-image-1` supports arbitrary non-square sizes in this codebase by default.
-        # Other known models are conservatively treated as square-only unless overridden in config.
+        # DALL·E-2 and DALL·E-3 are treated as square-only by default (config can override).
         defaults = {
-            # gpt-image-1 supports only these discrete sizes (per documentation):
-            #  - 1024x1024 (square)
-            #  - 1536x1024 (landscape)
-            #  - 1024x1536 (portrait)
             "gpt-image-1": {
                 "supports_non_square": True,
                 "allowed_sizes": ["1024x1024", "1536x1024", "1024x1536"],
                 "preferred_sizes": ["1536x1024", "1024x1536", "1024x1024"],
                 "default": "1024x1024",
             },
-            # Treat DALL·E variants as square-only by default (config can override)
-            "dall-e": {"supports_non_square": False, "preferred_sizes": ["1024x1024"], "default": "1024x1024"},
             "dall-e-2": {"supports_non_square": False, "preferred_sizes": ["1024x1024"], "default": "1024x1024"},
             "dall-e-3": {"supports_non_square": False, "preferred_sizes": ["1024x1024"], "default": "1024x1024"},
         }
@@ -755,28 +760,75 @@ class AIBackgroundService:
                     size=size,
                 )
 
-                # Try to extract the base64 payload from common response shapes
+                # Try to extract a base64 payload or a downloadable URL from common response shapes
                 image_base64 = None
+                image_url = None
                 try:
-                    # Some SDKs store result.data as a list-like object
-                    data0 = None
-                    try:
-                        data0 = result.data[0]
-                    except Exception:
-                        data0 = None
+                    # Normalize a dict-like view of the result when possible
+                    res_dict = None
+                    if isinstance(result, dict):
+                        res_dict = result
+                    else:
+                        try:
+                            res_dict = getattr(result, "__dict__", None) or None
+                        except Exception:
+                            res_dict = None
 
-                    if data0 is not None:
-                        image_base64 = getattr(data0, "b64_json", None) or getattr(data0, "b64", None) or getattr(data0, "base64", None)
-                    # Defensive: some SDKs may return a dict-like payload
-                    if not image_base64 and isinstance(result, (dict,)):
-                        # attempt to find an obvious key
-                        for k in ("b64_json", "b64", "base64", "data"):
-                            v = result.get(k)
+                    # Common shape: top-level `data` list
+                    data_list = None
+                    if res_dict and isinstance(res_dict.get("data", None), list):
+                        data_list = res_dict.get("data")
+                    else:
+                        # Some SDKs expose `data` as an attribute
+                        try:
+                            data_attr = getattr(result, "data", None)
+                            if isinstance(data_attr, (list, tuple)):
+                                data_list = list(data_attr)
+                        except Exception:
+                            data_list = None
+
+                    if data_list:
+                        d0 = data_list[0] if len(data_list) > 0 else None
+                        if isinstance(d0, dict):
+                            image_base64 = d0.get("b64_json") or d0.get("b64") or d0.get("base64") or d0.get("image")
+                            image_url = d0.get("url") or d0.get("image_url")
+                        else:
+                            image_base64 = getattr(d0, "b64_json", None) or getattr(d0, "b64", None) or getattr(d0, "base64", None)
+                            image_url = getattr(d0, "url", None)
+
+                    # Also check top-level fields for base64 or url
+                    if not image_base64 and res_dict:
+                        for k in ("b64_json", "b64", "base64", "image"):
+                            v = res_dict.get(k)
                             if isinstance(v, str) and v:
                                 image_base64 = v
                                 break
+                        if not image_url:
+                            for k in ("url", "image_url", "image_url_https"):
+                                v = res_dict.get(k)
+                                if isinstance(v, str) and v:
+                                    image_url = v
+                                    break
                 except Exception:
                     image_base64 = None
+                    image_url = None
+
+                # If no base64 payload found, but a URL was returned, try to download it.
+                if not image_base64 and image_url:
+                    try:
+                        resp_img = requests.get(image_url, timeout=10.0)
+                        resp_img.raise_for_status()
+                        os.makedirs(os.path.dirname(self._outfile), exist_ok=True)
+                        with open(self._outfile, "wb") as f:
+                            f.write(resp_img.content)
+                        self._last_refresh = datetime.datetime.now()
+                        self._logger.info(f"AI background image fetched from URL -> {self._outfile} (source: {image_url})")
+                        return
+                    except Exception as e:
+                        try:
+                            self._logger.debug("Failed to download image from URL: %s", str(e))
+                        except Exception:
+                            pass
 
                 # Log a compact summary of the response to help diagnose why no image was produced
                 if not image_base64:
@@ -789,6 +841,34 @@ class AIBackgroundService:
                                 res_summary = str(result)
                         except Exception:
                             res_summary = str(result)
+
+                        # Attempt to extract explicit API error/moderation fields if present
+                        try:
+                            res_dict = None
+                            if isinstance(result, dict):
+                                res_dict = result
+                            else:
+                                try:
+                                    res_dict = getattr(result, "__dict__", None) or None
+                                except Exception:
+                                    res_dict = None
+                            if res_dict:
+                                err = res_dict.get("error") or res_dict.get("errors")
+                                if err:
+                                    try:
+                                        self._logger.error("Image API returned error field: %s", json.dumps(err, default=str))
+                                    except Exception:
+                                        self._logger.error("Image API returned error field: %s", str(err))
+                                # moderation or status fields
+                                mod = res_dict.get("moderation") or res_dict.get("policy") or res_dict.get("status")
+                                if mod:
+                                    try:
+                                        self._logger.debug("Image API returned moderation/status info: %s", json.dumps(mod, default=str))
+                                    except Exception:
+                                        self._logger.debug("Image API returned moderation/status info: %s", str(mod))
+                        except Exception:
+                            pass
+
                         if len(res_summary) > 800:
                             res_summary = res_summary[:800] + "..."
 
@@ -809,6 +889,14 @@ class AIBackgroundService:
                             self._logger.error("OpenAI returned no image payload and result could not be summarized.")
                         except Exception:
                             pass
+                    # Also include the full raw result at debug level to aid diagnostics
+                    try:
+                        try:
+                            self._logger.debug("Full image API result: %s", json.dumps(result, default=str))
+                        except Exception:
+                            self._logger.debug("Full image API result (str): %s", str(result))
+                    except Exception:
+                        pass
 
                     self._logger.warning(
                         "OpenAI returned no image payload; applying fallback image."
