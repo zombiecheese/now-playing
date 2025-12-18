@@ -3,16 +3,31 @@
 **Now-playing** is a Python application for the Raspberry Pi that listens for background music, identifies the
 song, and displays the song information on an e-ink display.
 
-> This project was born out of a personal need: I love listening to vinyl, but since it's analog, I wasn't able to
-> easily tell what song was playing. Sure, you can count the spaces in the grooves, but that's not exactly convenient.
-> The same goes for music in films—I'd often reach for my phone to Shazam a song. Now, I just glance at my display.
 
-<table>
-<tr>
-<td><img src="resources/readme/example-image-1.jpeg" width="500px" alt="Example Image 1"/></td>
-<td><img src="resources/readme/example-image-2.jpeg" width="500px" alt="Example Image 2"/></td>
-</tr>
-</table>
+
+This like any good project is a fork of a fork of a fork.
+
+
+ill add some notes on what has changed + new features etc....
+
+
+
+
+all thanks to the hard work of..
+
+- [spotipi-eink (original)](https://github.com/ryanwa18/spotipi-eink)
+- [spotipi-eink (fork)](https://github.com/Gabbajoe/spotipi-eink)
+- [shazampi-eink (fork)](https://github.com/ravi72munde/shazampi-eink)
+
+special shout out to maurocastermans - im even keeping 90% of your read me :P
+
+- [now-playing (fork)](https://github.com/maurocastermans/now-playing)
+
+
+All credits for the original idea go to them. While they laid the groundwork, this version focuses on clean code,
+modularity, and extensibility.
+
+
 
 ## 🚀 Features
 
@@ -26,14 +41,9 @@ song, and displays the song information on an e-ink display.
 
 ## ✨ What's New?
 
-This project builds on and refactors several previous works (see [LICENSE](./LICENSE)):
 
-- [spotipi-eink (original)](https://github.com/ryanwa18/spotipi-eink)
-- [spotipi-eink (fork)](https://github.com/Gabbajoe/spotipi-eink)
-- [shazampi-eink (fork)](https://github.com/ravi72munde/shazampi-eink)
 
-All credits for the original idea go to them. While they laid the groundwork, this version focuses on clean code,
-modularity, and extensibility.
+
 
 ### ♻️ Improvements
 
