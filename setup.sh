@@ -190,11 +190,20 @@ orchestrator:
 openai:
   api_key: $openai_api_key
   prompt_style: "80s anime" # enter image style type (default is 80s anime)
+  model: "gpt-image-1"
 
-  # If image generation fails - fallback to these options (day night aware)
-  fallback_image_path_day: "${install_path}/resources/default_day.png" 
-  fallback_image_path_night: "${install_path}/resources/default_night.png" 
-  fallback_image_path: "${install_path}/resources/default.jpg"
+image:
+  orientation_strategy: "cover"   # "cover" or "contain"
+  max_square_size: 1024           # used only for DALL-E 2 fallback
+
+  fallback_image_path_day: "/home/zombiecheese/now-playing/resources/default_day.png"
+  fallback_image_path_night: "/home/zombiecheese/now-playing/resources/default_night.png"
+  fallback_image_path: "/home/zombiecheese/now-playing/resources/default.jpg"
+
+lighting:
+  day: "Use daytime lighting: natural brightness, appropriate color temperature, balanced contrast, and realistic shadows."
+  twilight: "Use twilight lighting: soft low-angle light, gentle shadows, a sky gradient, moderate contrast, and selective artificial lights beginning to appear."
+  night: "Render with low-light exposure: markedly darker scene, high contrast, cooler ambient tones, visible artificial lighting (street lamps, train interiors/headlights, illuminated windows), reduced sky luminance."
 
 audio:
   recording_duration_seconds: 5 # Total duration to record for music detection/identification (max 10)

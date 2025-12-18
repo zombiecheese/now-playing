@@ -60,16 +60,51 @@ class AIBackgroundService:
                 "Invalid geo_coordinates in config; disabling generation and using fallback."
             )
 
-        # OpenAI setup
+        # OpenAI & image setup
         openai_cfg = self._config.get("openai", {}) or {}
+        image_cfg = self._config.get("image", {}) or {}
+        lighting_cfg = self._config.get("lighting", {}) or {}
+
         self._api_key = openai_cfg.get("api_key") or os.environ.get("OPENAI_API_KEY") or ""
-        # NEW: support day/night-specific fallback images with legacy single-path as ultimate default
-        self._fallback_image_path_day = openai_cfg.get("fallback_image_path_day") or ""
-        self._fallback_image_path_night = openai_cfg.get("fallback_image_path_night") or ""
-        self._fallback_image_path = openai_cfg.get("fallback_image_path") or ""
+
+        # support day/night-specific fallback images with legacy single-path as ultimate default
+        self._fallback_image_path_day = image_cfg.get("fallback_image_path_day") or ""
+        self._fallback_image_path_night = image_cfg.get("fallback_image_path_night") or ""
+        self._fallback_image_path = image_cfg.get("fallback_image_path") or ""
+
+        # Lighting strings from config (day/twilight/night). Keep default hard-coded fallback.
+        self._lighting_cfg = lighting_cfg
+
+        # chosen OpenAI image model (configurable)
+        self._image_model = openai_cfg.get("model") or openai_cfg.get("image_model") or "gpt-image-1"
+
+        # model-specific image settings (can be provided in config under openai or image)
+        self._model_image_settings = openai_cfg.get("model_image_settings") or image_cfg.get("model_image_settings") or {}
+
+        # display size (used to prefer non-square when supported)
+        disp_cfg = self._config.get("display", {}) or {}
+        self._display_width = int(disp_cfg.get("width", 800))
+        self._display_height = int(disp_cfg.get("height", 480))
+        self._display_orientation = (disp_cfg.get("orientation") or "").lower() or "portrait"
+
+        # image config controls
+        self._orientation_strategy = (image_cfg.get("orientation_strategy") or (self._config.get("image", {}) or {}).get("orientation_strategy") or "cover").lower()
+        # maximum allowed dimension for generated images (caps model requests)
+        self._max_image_dimension = int((image_cfg.get("max_dimension") or (self._config.get("image", {}) or {}).get("max_dimension") or 2048))
+        # square size for square-only models (DALL·E fallback)
+        self._max_square_size = int((image_cfg.get("max_square_size") or (self._config.get("image", {}) or {}).get("max_square_size") or 1024))
 
         self._client: Optional[OpenAI] = None
         self._last_refresh: Optional[datetime.datetime] = None
+
+        # Cached per-refresh context (to avoid duplicate decisions/network calls)
+        self._weather_cache: Optional[dict] = None
+        self._city: Optional[str] = None
+        self._weather_desc: Optional[str] = None
+        self._astro_text: Optional[str] = None
+        self._lighting_text: Optional[str] = None
+        self._image_size: Optional[str] = None
+        self._model_info: Optional[dict] = None
 
         if not self._api_key:
             self._logger.warning(
@@ -80,6 +115,16 @@ class AIBackgroundService:
                 self._client = OpenAI(api_key=self._api_key)
             except Exception as e:
                 self._logger.error(f"Failed to initialize OpenAI client: {e}")
+
+        # optional timezone fallback from config (e.g., "Europe/London") used when OpenWeather fails
+        self._timezone_fallback = (self._config.get("weather", {}) or {}).get("timezone")
+
+        # Try to import zoneinfo for timezone-aware fallbacks (Python 3.9+)
+        try:
+            from zoneinfo import ZoneInfo  # type: ignore
+            self._ZoneInfo = ZoneInfo
+        except Exception:
+            self._ZoneInfo = None
 
     def _should_refresh(self) -> bool:
         """
@@ -98,24 +143,22 @@ class AIBackgroundService:
         Uses OpenWeather key + units=metric, reusing your coords.
         Safe if coords invalid: returns generic strings without network call.
         """
+        # Use cached weather if present
+        if self._weather_cache:
+            city = self._weather_cache.get("city") or "the nearest major city"
+            desc = self._weather_cache.get("weather_desc") or "current local conditions"
+            return city, desc
+
         if not self._coords_ok:
             return "the nearest major city", "current local conditions"
-        try:
-            base_url = "https://api.openweathermap.org/data/2.5/weather"
-            api_key = (self._config.get("weather", {}) or {}).get("openweathermap_api_key")
-            if not api_key:
-                raise RuntimeError("Missing weather.openweathermap_api_key in config")
-            url = f"{base_url}?lat={self._lat}&lon={self._lon}&units=metric&appid={api_key}"
-            resp = requests.get(url, timeout=6.0)
-            resp.raise_for_status()
-            data = resp.json()
-            city = data.get("name") or "the nearest major city"
-            # e.g., "overcast clouds" -> "Overcast clouds"
-            desc = (data.get("weather", [{}])[0].get("description") or "").strip().capitalize()
-            return city, desc or "current local conditions"
-        except Exception as e:
-            self._logger.debug(f"OpenWeather city/desc fetch failed: {type(e).__name__}: {e}")
+
+        # fetch and cache weather data for reuse by other helpers
+        data = self._fetch_weather_data()
+        if not data:
             return "the nearest major city", "current local conditions"
+        city = data.get("city") or "the nearest major city"
+        desc = data.get("weather_desc") or "current local conditions"
+        return city, desc
 
     # --- helper to compute sun/moon context string
     def _sun_moon_context(self) -> str:
@@ -124,52 +167,52 @@ class AIBackgroundService:
         Daytime -> sun azimuth/elevation; Night -> moon phase (as percentage).
         Fallbacks gracefully if astral isn't available or coords invalid.
         """
+        # Use cached results when available
+        if self._astro_text:
+            return self._astro_text
+
         if not self._coords_ok:
             return "Include the current sun/moon position in the sky appropriate for the local time."
+
         now_utc = datetime.datetime.now(datetime.timezone.utc)
 
-        # Decide day/night using OpenWeather sunrise/sunset when possible
+        # Use cached weather if present, otherwise try to fetch
+        if not self._weather_cache:
+            self._fetch_weather_data()
+
         try:
-            base_url = "https://api.openweathermap.org/data/2.5/weather"
-            api_key = (self._config.get("weather", {}) or {}).get("openweathermap_api_key")
-            if not api_key:
-                raise RuntimeError("Missing weather.openweathermap_api_key in config")
-            url = f"{base_url}?lat={self._lat}&lon={self._lon}&units=metric&appid={api_key}"
-            resp = requests.get(url, timeout=6.0)
-            resp.raise_for_status()
-            data = resp.json()
-            sys_info = data.get("sys", {}) or {}
-            sunrise_utc = datetime.datetime.utcfromtimestamp(sys_info.get("sunrise", 0)).replace(
-                tzinfo=datetime.timezone.utc
-            )
-            sunset_utc = datetime.datetime.utcfromtimestamp(sys_info.get("sunset", 0)).replace(
-                tzinfo=datetime.timezone.utc
-            )
-            is_day = sunrise_utc <= now_utc <= sunset_utc
+            sys_info = (self._weather_cache or {}).get("sys", {}) or {}
+            sunrise_ts = sys_info.get("sunrise")
+            sunset_ts = sys_info.get("sunset")
+            if sunrise_ts and sunset_ts:
+                sunrise_utc = datetime.datetime.utcfromtimestamp(sunrise_ts).replace(tzinfo=datetime.timezone.utc)
+                sunset_utc = datetime.datetime.utcfromtimestamp(sunset_ts).replace(tzinfo=datetime.timezone.utc)
+                is_day = sunrise_utc <= now_utc <= sunset_utc
+            else:
+                # fallback to timezone/local-hour heuristic
+                local_hour = datetime.datetime.now().hour
+                is_day = 7 <= local_hour <= 19
         except Exception as e:
-            # if any failure, assume day between 07–19 local time
             self._logger.debug(f"OpenWeather day/night check failed: {type(e).__name__}: {e}")
             local_hour = datetime.datetime.now().hour
             is_day = 7 <= local_hour <= 19
 
         if _ASTRAL_OK:
             try:
-                # Astral v2+ expects Observer + aware datetime (UTC is fine)
                 obs = Observer(latitude=float(self._lat), longitude=float(self._lon), elevation=0.0)
                 if is_day:
-                    az = float(sun_azimuth(obs, now_utc))   # aware UTC datetime
-                    el = float(sun_elevation(obs, now_utc)) # aware UTC datetime
-                    return f"Include the sun at its current position (azimuth {az:.0f}°, elevation {el:.0f}°)."
+                    az = float(sun_azimuth(obs, now_utc))
+                    el = float(sun_elevation(obs, now_utc))
+                    self._astro_text = f"Include the sun at its current position (azimuth {az:.0f}°, elevation {el:.0f}°)."
                 else:
-                    # Astral moon.phase returns phase-day in [0..~29.53], not a percent
                     ph_days = float(moon_phase(now_utc))
                     ph_pct = max(0.0, min(100.0, (ph_days / 29.53) * 100.0))
-                    return f"Include the moon with its current phase (~{ph_pct:.0f}%)."
+                    self._astro_text = f"Include the moon with its current phase (~{ph_pct:.0f}%)."
+                return self._astro_text
             except Exception as e:
                 self._logger.debug(f"Astral calculation failed: {type(e).__name__}: {e}")
                 return "Include the current sun/moon position in the sky appropriate for the local time."
         else:
-            # Astral not available
             return "Include the current sun/moon position in the sky appropriate for the local time."
 
     # --- NEW: determine day/night (reusing OpenWeather first, fallback to local time)
@@ -178,30 +221,43 @@ class AIBackgroundService:
         Returns True if it's currently day at the configured coordinates, else False.
         Uses OpenWeather sunrise/sunset when possible; otherwise falls back to 07–19 local-hour heuristic.
         """
+        # If coords invalid, prefer a configured timezone fallback when present
         if not self._coords_ok:
-            # If coords invalid, use the same heuristic as in _sun_moon_context()
-            local_hour = datetime.datetime.now().hour
-            return 7 <= local_hour <= 19
+            try:
+                if self._timezone_fallback and self._ZoneInfo:
+                    now_local = datetime.datetime.now(self._ZoneInfo(self._timezone_fallback))
+                    local_hour = now_local.hour
+                else:
+                    local_hour = datetime.datetime.now().hour
+                return 7 <= local_hour <= 19
+            except Exception:
+                local_hour = datetime.datetime.now().hour
+                return 7 <= local_hour <= 19
+        # Use cached weather if available
+        if not self._weather_cache:
+            self._fetch_weather_data()
+
         try:
-            base_url = "https://api.openweathermap.org/data/2.5/weather"
-            api_key = (self._config.get("weather", {}) or {}).get("openweathermap_api_key")
-            if not api_key:
-                raise RuntimeError("Missing weather.openweathermap_api_key in config")
-            url = f"{base_url}?lat={self._lat}&lon={self._lon}&units=metric&appid={api_key}"
-            resp = requests.get(url, timeout=6.0)
-            resp.raise_for_status()
-            data = resp.json()
-            sys_info = data.get("sys", {}) or {}
-            now_utc = datetime.datetime.now(datetime.timezone.utc)
-            sunrise_utc = datetime.datetime.utcfromtimestamp(sys_info.get("sunrise", 0)).replace(
-                tzinfo=datetime.timezone.utc
-            )
-            sunset_utc = datetime.datetime.utcfromtimestamp(sys_info.get("sunset", 0)).replace(
-                tzinfo=datetime.timezone.utc
-            )
-            return sunrise_utc <= now_utc <= sunset_utc
+            sys_info = (self._weather_cache or {}).get("sys", {}) or {}
+            sunrise_ts = sys_info.get("sunrise")
+            sunset_ts = sys_info.get("sunset")
+            if sunrise_ts and sunset_ts:
+                now_utc = datetime.datetime.now(datetime.timezone.utc)
+                sunrise_utc = datetime.datetime.utcfromtimestamp(sunrise_ts).replace(tzinfo=datetime.timezone.utc)
+                sunset_utc = datetime.datetime.utcfromtimestamp(sunset_ts).replace(tzinfo=datetime.timezone.utc)
+                return sunrise_utc <= now_utc <= sunset_utc
+            # otherwise fall back to timezone/local heuristic below
         except Exception as e:
             self._logger.debug(f"Day/night check fallback: {type(e).__name__}: {e}")
+
+        try:
+            if self._timezone_fallback and self._ZoneInfo:
+                now_local = datetime.datetime.now(self._ZoneInfo(self._timezone_fallback))
+                local_hour = now_local.hour
+            else:
+                local_hour = datetime.datetime.now().hour
+            return 7 <= local_hour <= 19
+        except Exception:
             local_hour = datetime.datetime.now().hour
             return 7 <= local_hour <= 19
 
@@ -227,22 +283,270 @@ class AIBackgroundService:
         return self._fallback_image_path  # may be empty
 
     def _lighting_instructions(self) -> str:
+        # If prepared context already set lighting text, return it to avoid recomputation
+        if self._lighting_text:
+            return self._lighting_text
+
+        # Prefer lighting strings provided in config under the `lighting` key.
         astro = (self._sun_moon_context() or "").lower()
-        if "astronomical night" in astro or "nautical night" in astro or "night" in astro:
-            return (
-                "Render with low-light exposure: markedly darker scene, high contrast, cooler ambient tones, "
-                "visible artificial lighting (street lamps, train interiors/headlights, illuminated windows), "
-                "specular highlights on wet surfaces, reduced sky luminance."
+        # Detect twilight keywords first
+        is_twilight = any(k in astro for k in ("civil twilight", "dusk", "dawn", "twilight"))
+        if is_twilight:
+            return self._lighting_cfg.get("twilight") or (
+                "Use twilight lighting: soft low-angle light, gentle shadows, a sky gradient, moderate contrast, and selective artificial lights beginning to appear."
             )
-        if "civil twilight" in astro or "dusk" in astro or "dawn" in astro:
-            return (
-                "Use twilight lighting: soft low-angle light, gentle shadows, sky gradient, moderate contrast, "
-                "selective artificial lights beginning to appear."
+
+        # Use daytime detection for day/night; fall back to astro text if needed
+        try:
+            if self._is_daytime():
+                return self._lighting_cfg.get("day") or (
+                    "Use daytime lighting: natural brightness, appropriate color temperature for the time, balanced contrast, and realistic shadows."
+                )
+            else:
+                return self._lighting_cfg.get("night") or (
+                    "Render with low-light exposure: markedly darker scene, high contrast, cooler ambient tones, visible artificial lighting (street lamps, train interiors/headlights, illuminated windows), reduced sky luminance."
+                )
+        except Exception:
+            # If day/night check fails, fall back to analyzing astro text
+            if "night" in astro:
+                return self._lighting_cfg.get("night") or (
+                    "Render with low-light exposure: markedly darker scene, high contrast, cooler ambient tones, visible artificial lighting (street lamps, train interiors/headlights, illuminated windows),reduced sky luminance."
+                )
+            return self._lighting_cfg.get("day") or (
+                "Use daytime lighting: natural brightness, appropriate color temperature for the time, balanced contrast, and realistic shadows."
             )
-        return (
-            "Use daytime lighting: natural brightness, appropriate color temperature for the time, "
-            "balanced contrast, and realistic shadows."
-        )
+
+    def _choose_image_size(self) -> str:
+        """
+        Pick an appropriate image size string ("{w}x{h}") based on the selected model,
+        configured model/image settings, and the display aspect ratio. Prefer non-square
+        sizes when the model supports them and the display is non-square.
+        """
+        model = str(self._image_model)
+        model_info = self._get_model_info(model)
+
+        # Honor configured display orientation by swapping width/height when needed
+        w = int(self._display_width)
+        h = int(self._display_height)
+        orient = (self._display_orientation or "").lower()
+        if orient.startswith("portrait") and w > h:
+            w, h = h, w
+        elif orient.startswith("landscape") and h > w:
+            w, h = h, w
+
+        def parse_size(s: str) -> Optional[Tuple[int, int]]:
+            try:
+                a, b = s.split("x")
+                return int(a), int(b)
+            except Exception:
+                return None
+
+        def cap_and_format(width: int, height: int) -> str:
+            # Cap to max dimension while preserving aspect ratio
+            maxd = max(1, int(self._max_image_dimension))
+            if width <= maxd and height <= maxd:
+                return f"{width}x{height}"
+            # scale down so the larger side == maxd
+            if width >= height:
+                scale = maxd / float(width)
+            else:
+                scale = maxd / float(height)
+            nw = max(1, int(round(width * scale)))
+            nh = max(1, int(round(height * scale)))
+            return f"{nw}x{nh}"
+
+        asp = f"{w}x{h}"
+
+        # If the model exposes explicit allowed sizes (e.g., gpt-image-1), choose among them.
+        allowed = model_info.get("allowed_sizes") or []
+        if allowed:
+            # build parsed candidates
+            candidates = []
+            for s in allowed:
+                parsed = parse_size(s)
+                if not parsed:
+                    continue
+                pw, ph = parsed
+                candidates.append((pw * ph, pw, ph, s))
+
+            # display orientation
+            display_is_portrait = h > w
+
+            # matching candidates prefer those matching orientation (portrait/landscape)
+            matching = []
+            for area, pw, ph, s in candidates:
+                if display_is_portrait and ph > pw:
+                    matching.append((area, pw, ph, s))
+                elif (not display_is_portrait) and pw > ph:
+                    matching.append((area, pw, ph, s))
+                elif pw == ph:
+                    matching.append((area, pw, ph, s))
+
+            use_set = matching or candidates
+
+            # orientation strategy selection
+            if self._orientation_strategy == "cover":
+                # choose smallest area that covers display
+                cover = [(area, pw, ph, s) for (area, pw, ph, s) in use_set if pw >= w and ph >= h]
+                if cover:
+                    cover.sort()
+                    _, pw, ph, s = cover[0]
+                    return cap_and_format(pw, ph)
+                # otherwise choose largest available
+                use_set.sort(reverse=True)
+                _, pw, ph, s = use_set[0]
+                return cap_and_format(pw, ph)
+            else:
+                # contain: choose largest that fits within display
+                contain = [(area, pw, ph, s) for (area, pw, ph, s) in use_set if pw <= w and ph <= h]
+                if contain:
+                    contain.sort(reverse=True)
+                    _, pw, ph, s = contain[0]
+                    return cap_and_format(pw, ph)
+                use_set.sort()
+                _, pw, ph, s = use_set[0]
+                return cap_and_format(pw, ph)
+
+        # If model supports non-square and display isn't square, try exact match first
+        if model_info.get("supports_non_square") and w != h:
+            prefs = model_info.get("preferred_sizes", []) or []
+            # orientation strategy: "cover" -> prefer sizes that cover the display; "contain" -> prefer sizes that fit within
+            if self._orientation_strategy == "cover":
+                # prefer preferred sizes that at least cover the display
+                candidates = []
+                for s in prefs:
+                    parsed = parse_size(s)
+                    if not parsed:
+                        continue
+                    pw, ph = parsed
+                    if pw >= w and ph >= h:
+                        candidates.append((pw * ph, pw, ph))
+                if candidates:
+                    # pick smallest area that still covers
+                    candidates.sort()
+                    _, pw, ph = candidates[0]
+                    return cap_and_format(pw, ph)
+                # no preferred covered; fall back to requested display size (capped)
+                return cap_and_format(w, h)
+            else:
+                # contain: prefer preferred sizes that fit within the display (largest area)
+                candidates = []
+                for s in prefs:
+                    parsed = parse_size(s)
+                    if not parsed:
+                        continue
+                    pw, ph = parsed
+                    if pw <= w and ph <= h:
+                        candidates.append((pw * ph, pw, ph))
+                if candidates:
+                    candidates.sort(reverse=True)
+                    _, pw, ph = candidates[0]
+                    return cap_and_format(pw, ph)
+                # else fall back to display size (capped)
+                return cap_and_format(w, h)
+
+        # Otherwise pick a square size: try preferred_sizes then default
+        for s in model_info.get("preferred_sizes", []):
+            if "x" in s:
+                a, b = s.split("x")
+                if a == b:
+                    return s
+        # last resort: use configured image.max_square_size or 1024
+        max_sq = int((self._config.get("image", {}) or {}).get("max_square_size", 1024))
+        return f"{max_sq}x{max_sq}"
+
+    def _fetch_weather_data(self) -> Optional[dict]:
+        """
+        Fetch weather data once and cache it. Returns a dict with keys:
+        city, weather_desc, sys (dict with sunrise/sunset timestamps), raw (full json)
+        or None on failure.
+        """
+        try:
+            if not self._coords_ok:
+                return None
+            base_url = "https://api.openweathermap.org/data/2.5/weather"
+            api_key = (self._config.get("weather", {}) or {}).get("openweathermap_api_key")
+            if not api_key:
+                self._logger.debug("Missing weather.openweathermap_api_key in config; skipping weather fetch")
+                return None
+            url = f"{base_url}?lat={self._lat}&lon={self._lon}&units=metric&appid={api_key}"
+            resp = requests.get(url, timeout=6.0)
+            resp.raise_for_status()
+            data = resp.json()
+            city = data.get("name") or "the nearest major city"
+            desc = (data.get("weather", [{}])[0].get("description") or "").strip().capitalize()
+            sys_info = data.get("sys", {}) or {}
+            self._weather_cache = {"city": city, "weather_desc": desc or "current local conditions", "sys": sys_info, "raw": data}
+            return self._weather_cache
+        except Exception as e:
+            self._logger.debug(f"OpenWeather fetch failed: {type(e).__name__}: {e}")
+            self._weather_cache = None
+            return None
+
+    def _get_model_info(self, model: str) -> dict:
+        """Return a dict describing model capabilities, overridable from config."""
+        cfg_map = self._model_image_settings or {}
+        cfg = cfg_map.get(model, {}) or {}
+
+        # Only `gpt-image-1` supports arbitrary non-square sizes in this codebase by default.
+        # Other known models are conservatively treated as square-only unless overridden in config.
+        defaults = {
+            # gpt-image-1 supports only these discrete sizes (per documentation):
+            #  - 1024x1024 (square)
+            #  - 1536x1024 (landscape)
+            #  - 1024x1536 (portrait)
+            "gpt-image-1": {
+                "supports_non_square": True,
+                "allowed_sizes": ["1024x1024", "1536x1024", "1024x1536"],
+                "preferred_sizes": ["1536x1024", "1024x1536", "1024x1024"],
+                "default": "1024x1024",
+            },
+            # Treat DALL·E variants as square-only by default (config can override)
+            "dall-e": {"supports_non_square": False, "preferred_sizes": ["1024x1024"], "default": "1024x1024"},
+            "dall-e-2": {"supports_non_square": False, "preferred_sizes": ["1024x1024"], "default": "1024x1024"},
+            "dall-e-3": {"supports_non_square": False, "preferred_sizes": ["1024x1024"], "default": "1024x1024"},
+        }
+
+        model_info = defaults.get(model, defaults.get("gpt-image-1")).copy()
+        # apply overrides
+        if "supports_non_square" in cfg:
+            model_info["supports_non_square"] = bool(cfg.get("supports_non_square"))
+        if "preferred_sizes" in cfg and isinstance(cfg.get("preferred_sizes"), list):
+            model_info["preferred_sizes"] = cfg.get("preferred_sizes")
+        if "default" in cfg:
+            model_info["default"] = cfg.get("default")
+        return model_info
+
+    def _prepare_context(self) -> None:
+        """Compute and cache all per-refresh decisions (weather, astro, lighting, model, size)."""
+        # refresh weather cache
+        try:
+            self._fetch_weather_data()
+        except Exception:
+            self._weather_cache = None
+
+        # set city/weather fields for prompt building
+        city, desc = self._fetch_city_and_weather_desc()
+        self._city = city
+        self._weather_desc = desc
+
+        # astro text and lighting text (these functions will use cached weather)
+        try:
+            self._astro_text = self._sun_moon_context()
+        except Exception:
+            self._astro_text = None
+        try:
+            self._lighting_text = self._lighting_instructions()
+        except Exception:
+            self._lighting_text = None
+
+        # model info + chosen image size
+        try:
+            self._model_info = self._get_model_info(str(self._image_model))
+            self._image_size = self._choose_image_size()
+        except Exception:
+            self._model_info = None
+            self._image_size = None
 
     # --- build the final prompt string
     def _build_dynamic_prompt(self) -> str:
@@ -280,14 +584,20 @@ class AIBackgroundService:
                 self._apply_fallback_image()
                 return
 
+            # Prepare all per-refresh context (weather, astro, lighting, model info, image size)
+            self._prepare_context()
+
             # Attempt to generate the image via Images API
             prompt = self._build_dynamic_prompt()
+            # prefer the prepared image size if available
+            size = self._image_size or self._choose_image_size()
             self._logger.debug("OpenAI image prompt: %s", prompt)
+            self._logger.debug("Image generation model=%s size=%s", self._image_model, size)
             try:
                 result = self._client.images.generate(
-                    model="gpt-image-1",  # Images model
+                    model=self._image_model,
                     prompt=prompt,
-                    size="1024x1024",     # adjust to your display pipeline (e.g., 800x480 then fit)
+                    size=size,
                 )
                 image_base64 = getattr(result.data[0], "b64_json", None)
                 if not image_base64:
