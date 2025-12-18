@@ -1,6 +1,8 @@
 
 import logging
 import sys
+import os
+import json
 import numpy as np
 import traceback
 import signal
@@ -85,6 +87,11 @@ class NowPlaying:
         self._ai_bg: AIBackgroundService = AIBackgroundService()
         # When True: force using AI background fallback images (no generation)
         self._ai_bg_fallback_mode: bool = False
+        # Load persisted toggle state (if present)
+        try:
+            self._load_toggle_state_from_file()
+        except Exception:
+            pass
 
         import inspect
 
@@ -250,8 +257,24 @@ class NowPlaying:
         A small red dot will be shown on the screensaver when the fallback image is available.
         """
         try:
-            self._ai_bg_fallback_mode = not self._ai_bg_fallback_mode
-            self._logger.info(f"AI background fallback mode toggled to: {self._ai_bg_fallback_mode}")
+            prev = bool(self._ai_bg_fallback_mode)
+            self._ai_bg_fallback_mode = not prev
+            try:
+                self._save_toggle_state_to_file()
+            except Exception as e:
+                self._logger.warning(f"Failed to persist toggle state: {e}")
+
+            self._logger.info(f"AI background fallback mode changed: {prev} -> {self._ai_bg_fallback_mode}")
+
+            # If generation was re-enabled (toggle turned OFF), attempt an immediate background refresh in worker thread
+            if not self._ai_bg_fallback_mode:
+                def worker_refresh():
+                    try:
+                        self._ai_bg.refresh_background_if_needed()
+                    except Exception as e:
+                        self._logger.warning(f"Background refresh after toggle failed: {e}")
+
+                threading.Thread(target=worker_refresh, daemon=True).start()
 
             # Immediately update screensaver to reflect the new mode (if screensaver active or eligible)
             if (
@@ -275,6 +298,41 @@ class NowPlaying:
         except Exception as e:
             self._logger.error(f"Error toggling AI background fallback mode: {e}")
             self._logger.error(traceback.format_exc())
+
+    def _state_file_path(self) -> str:
+        # Persist toggle state next to the main config YAML
+        base = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'config'))
+        try:
+            os.makedirs(base, exist_ok=True)
+        except Exception:
+            pass
+        return os.path.join(base, 'toggle_state.json')
+
+    def _load_toggle_state_from_file(self) -> None:
+        path = self._state_file_path()
+        try:
+            if os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self._ai_bg_fallback_mode = bool(data.get('ai_bg_fallback_mode', False))
+                    self._logger.info(f"Loaded AI background fallback mode from {path}: {self._ai_bg_fallback_mode}")
+        except Exception as e:
+            self._logger.warning(f"Failed to load toggle state from {path}: {e}")
+
+    def _save_toggle_state_to_file(self) -> None:
+        path = self._state_file_path()
+        try:
+            temp = path + '.tmp'
+            with open(temp, 'w', encoding='utf-8') as f:
+                json.dump({'ai_bg_fallback_mode': bool(self._ai_bg_fallback_mode)}, f)
+            try:
+                os.replace(temp, path)
+            except Exception:
+                # os.replace may not be atomic on some platforms; fallback to rename
+                os.rename(temp, path)
+            self._logger.debug(f"Persisted AI background fallback mode to {path}: {self._ai_bg_fallback_mode}")
+        except Exception as e:
+            self._logger.warning(f"Failed to persist toggle state to {path}: {e}")
 
 
 if __name__ == "__main__":
