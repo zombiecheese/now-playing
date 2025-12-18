@@ -440,6 +440,29 @@ class AIBackgroundService:
 
         asp = f"{w}x{h}"
 
+        # Prefer orientation-honored size for gpt-image-1 when possible
+        try:
+            if model == "gpt-image-1":
+                display_is_portrait = h > w
+                # orientation-preferred candidates for gpt-image-1
+                if display_is_portrait:
+                    pref_str = "1024x1536"
+                elif w > h:
+                    pref_str = "1536x1024"
+                else:
+                    pref_str = model_info.get("default", "1024x1024")
+
+                # If model exposes allowed or preferred sizes, prefer the orientation match
+                allowed = model_info.get("allowed_sizes") or []
+                prefs = model_info.get("preferred_sizes") or []
+                parsed = parse_size(pref_str)
+                if parsed:
+                    pw, ph = parsed
+                    if pref_str in allowed or pref_str in prefs or not allowed:
+                        return cap_and_format(pw, ph)
+        except Exception:
+            # If anything unexpected happens here, continue with normal selection logic
+            pass
         # If the model exposes explicit allowed sizes (e.g., gpt-image-1), choose among them.
         allowed = model_info.get("allowed_sizes") or []
         if allowed:
