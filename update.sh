@@ -12,13 +12,15 @@ if [ -d "now-playing" ]; then
       sudo systemctl stop now-playing
   fi
   echo "==> fetching updated code from git"
-  cd now-playing 
+  cd now-playing
+
   git init
   git remote remove origin
   git remote add origin https://github.com/zombiecheese/now-playing
   git fetch origin
   git reset --hard origin/main
   exit
+  
   #install_path=$(pwd)
   #source "${install_path}/venv/bin/activate" && echo "✔ Virtual environment activated."
   #echo "==> upgrading required Python packages..."
