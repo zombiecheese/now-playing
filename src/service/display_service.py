@@ -43,10 +43,11 @@ class DisplayService:
         # HTTP session for image fetches (reuses connections)
         self._http = requests.Session()
 
-        # Orientation & rotation
+        # Orientation & rotation (defaults; runtime overrides come from toggle_state)
         dcfg = self._config.get("display", {})
-        self._orientation = (dcfg.get("orientation") or "landscape").lower()
-        self._portrait_rotate_degrees = int(dcfg.get("portrait_rotate_degrees", 90))
+        self._orientation = "landscape"
+        self._portrait_rotate_degrees = 90
+        self._landscape_rotate_degrees = 0
 
         # Weather background (file path optional)
         self._weather_bg_path = dcfg.get("weather_background_image") or dcfg.get("screensaver_image")
@@ -142,6 +143,36 @@ class DisplayService:
         except Exception as e:
             self._logger.error(f"Error cleaning display: {e}")
             self._logger.error(traceback.format_exc())
+
+    def set_orientation(
+        self,
+        orientation: str,
+        portrait_rotate_degrees: Optional[int] = None,
+        landscape_rotate_degrees: Optional[int] = None,
+    ) -> None:
+        """
+        Dynamically change the display orientation and (optionally) rotation degrees.
+        Valid values for orientation: "portrait" or "landscape".
+        """
+        orientation = (orientation or "landscape").lower()
+        if orientation not in ("portrait", "landscape"):
+            self._logger.warning(
+                f"Invalid orientation '{orientation}'; keeping current '{self._orientation}'"
+            )
+            return
+
+        if portrait_rotate_degrees is not None:
+            self._portrait_rotate_degrees = int(portrait_rotate_degrees)
+        if landscape_rotate_degrees is not None:
+            self._landscape_rotate_degrees = int(landscape_rotate_degrees)
+
+        self._orientation = orientation
+        self._logger.info(
+            "Orientation changed to %s (portrait_rotate=%s, landscape_rotate=%s)",
+            self._orientation,
+            self._portrait_rotate_degrees,
+            self._landscape_rotate_degrees,
+        )
 
     def update_display_to_playing(self, song_info: SongInfo) -> None:
         """
@@ -240,6 +271,8 @@ class DisplayService:
         """Rotate canvas for portrait if configured."""
         if self._orientation == "portrait":
             return image.rotate(self._portrait_rotate_degrees, expand=True)
+        if self._landscape_rotate_degrees:
+            return image.rotate(self._landscape_rotate_degrees, expand=True)
         return image
 
     def _finalize_for_hardware(self, image: Image.Image) -> Image.Image:

@@ -173,13 +173,6 @@ display:
   # Weather mode background (full-screen fit, orientation-aware, same location at ai generation)
   weather_background_image: "${install_path}/resources/ai_screensaver.png"
 
-  # Global orientation (fallback if mode-specific values are not set)
-  orientation: $orientation           # "portrait" or "landscape"
-  
-  # Rotation to align the portrait canvas to your hardware buffer
-  # Change to 270 if your panel is mounted the other way.
-  portrait_rotate_degrees: 90
-  
   # Background fill behind square album art in portrait playing mode
   portrait_album_background_color: "black"
 

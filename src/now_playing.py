@@ -87,6 +87,10 @@ class NowPlaying:
         self._ai_bg: AIBackgroundService = AIBackgroundService()
         # When True: force using AI background fallback images (no generation)
         self._ai_bg_fallback_mode: bool = False
+        # Display orientation (portrait or landscape) defaults; toggle_state overrides
+        self._orientation: str = "portrait"
+        self._portrait_rotate_degrees: int = 90
+        self._landscape_rotate_degrees: int = 0
         # Load persisted toggle state (if present)
         try:
             self._load_toggle_state_from_file()
@@ -234,6 +238,8 @@ class NowPlaying:
                         self._handle_button_a()
                     elif button_label == "B":
                         self._handle_button_b()
+                    elif button_label == "C":
+                        self._handle_button_c()
 
         threading.Thread(target=listen, daemon=True).start()
 
@@ -300,6 +306,60 @@ class NowPlaying:
             self._logger.error(f"Error toggling AI background fallback mode: {e}")
             self._logger.error(traceback.format_exc())
 
+    def _handle_button_c(self) -> None:
+        """Toggle display orientation between portrait and landscape, then redraw the display."""
+        try:
+            # Toggle orientation
+            prev_orientation = self._orientation
+            self._orientation = "portrait" if self._orientation == "landscape" else "landscape"
+
+            # Update the display service with the new orientation and current rotation settings
+            self._display_service.set_orientation(
+                self._orientation,
+                portrait_rotate_degrees=self._portrait_rotate_degrees,
+                landscape_rotate_degrees=self._landscape_rotate_degrees,
+            )
+            
+            # Persist the new orientation
+            try:
+                self._save_toggle_state_to_file()
+            except Exception as e:
+                self._logger.warning(f"Failed to persist orientation change: {e}")
+            
+            self._logger.info(f"Display orientation changed: {prev_orientation} -> {self._orientation}")
+            
+            # Redraw the current display with the new orientation
+            current_state = self._state_manager.get_state().current
+            if current_state == DisplayState.PLAYING:
+                # Redraw the playing screen
+                playing_state = self._state_manager.get_playing_state()
+                # Create minimal SongInfo from stored state
+                from service.song_identify_service import SongInfo
+                song_info = SongInfo(
+                    title=playing_state.song_title,
+                    artist=playing_state.song_artist,
+                    album=None,
+                    release_year=None,
+                    album_art=None
+                )
+                self._display_service.update_display_to_playing(song_info)
+            elif current_state == DisplayState.SCREENSAVER:
+                # Redraw the screensaver with current weather
+                weather_info = self._weather_service.get_weather_info()
+                fallback_path = None
+                show_dot = False
+                try:
+                    if self._ai_bg_fallback_mode:
+                        fallback_path = self._ai_bg.get_fallback_path()
+                        if fallback_path:
+                            show_dot = True
+                except Exception:
+                    fallback_path = None
+                self._display_service.update_display_to_screensaver(weather_info, show_ai_dot=show_dot, fallback_image_path=fallback_path)
+        except Exception as e:
+            self._logger.error(f"Error toggling orientation: {e}")
+            self._logger.error(traceback.format_exc())
+
     def _state_file_path(self) -> str:
         # Persist toggle state next to the main config YAML
         base = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'config'))
@@ -316,7 +376,21 @@ class NowPlaying:
                 with open(path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     self._ai_bg_fallback_mode = bool(data.get('ai_bg_fallback_mode', False))
+                    self._orientation = (data.get('orientation') or self._orientation).lower()
+                    self._portrait_rotate_degrees = int(data.get('portrait_rotate_degrees', self._portrait_rotate_degrees))
+                    self._landscape_rotate_degrees = int(data.get('landscape_rotate_degrees', self._landscape_rotate_degrees))
+                    self._display_service.set_orientation(
+                        self._orientation,
+                        portrait_rotate_degrees=self._portrait_rotate_degrees,
+                        landscape_rotate_degrees=self._landscape_rotate_degrees,
+                    )
                     self._logger.info(f"Loaded AI background fallback mode from {path}: {self._ai_bg_fallback_mode}")
+                    self._logger.info(
+                        "Loaded display orientation=%s, portrait_rotate=%s, landscape_rotate=%s",
+                        self._orientation,
+                        self._portrait_rotate_degrees,
+                        self._landscape_rotate_degrees,
+                    )
         except Exception as e:
             self._logger.warning(f"Failed to load toggle state from {path}: {e}")
 
@@ -325,7 +399,15 @@ class NowPlaying:
         try:
             temp = path + '.tmp'
             with open(temp, 'w', encoding='utf-8') as f:
-                json.dump({'ai_bg_fallback_mode': bool(self._ai_bg_fallback_mode)}, f)
+                json.dump(
+                    {
+                        'ai_bg_fallback_mode': bool(self._ai_bg_fallback_mode),
+                        'orientation': self._orientation,
+                        'portrait_rotate_degrees': self._portrait_rotate_degrees,
+                        'landscape_rotate_degrees': self._landscape_rotate_degrees,
+                    },
+                    f,
+                )
             try:
                 os.replace(temp, path)
             except Exception:
