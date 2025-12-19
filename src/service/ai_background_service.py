@@ -452,11 +452,11 @@ class AIBackgroundService:
 
         asp = f"{w}x{h}"
 
-        # Prefer orientation-honored size for gpt-image-1 when possible
+        # Prefer orientation-honored size for OpenAI's GPT Image family when possible
         try:
-            if model == "gpt-image-1":
+            if model.startswith("gpt-image"):
                 display_is_portrait = h > w
-                # orientation-preferred candidates for gpt-image-1
+                # orientation-preferred candidates for gpt-image family
                 if display_is_portrait:
                     pref_str = "1024x1536"
                 elif w > h:
@@ -475,7 +475,7 @@ class AIBackgroundService:
         except Exception:
             # If anything unexpected happens here, continue with normal selection logic
             pass
-        # If the model exposes explicit allowed sizes (e.g., gpt-image-1), choose among them.
+        # If the model exposes explicit allowed sizes (e.g., any gpt-image-*), choose among them.
         allowed = model_info.get("allowed_sizes") or []
         if allowed:
             # build parsed candidates
@@ -628,7 +628,7 @@ class AIBackgroundService:
         except Exception:
             pass
 
-        # Only `gpt-image-1` supports arbitrary non-square sizes in this codebase by default.
+        # By default treat any `gpt-image-*` model as supporting non-square sizes.
         # DALL·E-2 and DALL·E-3 are treated as square-only by default (config can override).
         defaults = {
             "gpt-image-1": {
