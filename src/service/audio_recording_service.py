@@ -2,6 +2,7 @@ import logging
 
 import sounddevice as sd
 import numpy as np
+from config import Config
 from typing import Optional, Tuple
 
 import sys
@@ -50,7 +51,23 @@ class AudioRecordingService:
             self._logger.info(f"Recording for {duration} seconds at {self._sampling_rate} Hz.")
             audio = sd.rec(int(duration * self._sampling_rate), dtype=np.float32)
             sd.wait()
-            return np.squeeze(audio)
+            audio = np.squeeze(audio)
+
+            # Apply optional gain (in dB) from config
+            try:
+                cfg = Config().get_config()
+                audio_cfg = cfg.get('audio', {}) if isinstance(cfg, dict) else {}
+                gain_db = float(audio_cfg.get('gain_db', 0.0) or 0.0)
+                if gain_db != 0.0:
+                    multiplier = 10 ** (gain_db / 20.0)
+                    self._logger.debug(f"Applying gain {gain_db} dB -> multiplier {multiplier:.3f}")
+                    audio = audio * multiplier
+                    # Clip to float32 audio range to avoid overflow
+                    audio = np.clip(audio, -1.0, 1.0)
+            except Exception as e:
+                self._logger.warning(f"Failed to apply gain from config: {e}")
+
+            return audio
         except Exception as e:
             self._logger.error(f"Recording failed: {e}")
             raise RuntimeError("Recording failed.") from e

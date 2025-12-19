@@ -212,6 +212,9 @@ audio:
   debugaudio: false
   # Optional directory path to write debug WAV files. If omitted, uses ./debug_audio
   debugaudio_path: "${install_path}/debug_audio"
+  # Optional gain (in dB) to apply to recorded audio. 0.0 = no change.
+  # Positive values amplify, negative attenuate.
+  gain_db: 0.0
 
 log:
   log_file_path: "${install_path}/log/now_playing.log" 
