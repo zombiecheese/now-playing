@@ -4,15 +4,7 @@
 song, and displays the song information on an e-ink display.
 
 
-
-This like any good project is a fork of a fork of a fork.
-
-
-ill add some notes on what has changed + new features etc....
-
-
-
-
+This, like any good project is a fork of a fork of a fork.
 all thanks to the hard work of..
 
 - [spotipi-eink (original)](https://github.com/ryanwa18/spotipi-eink)
@@ -20,12 +12,10 @@ all thanks to the hard work of..
 - [shazampi-eink (fork)](https://github.com/ravi72munde/shazampi-eink)
 
 special shout out to maurocastermans - im even keeping 90% of your read me :P
-
 - [now-playing (fork)](https://github.com/maurocastermans/now-playing)
 
 
-All credits for the original idea go to them. While they laid the groundwork, this version focuses on clean code,
-modularity, and extensibility.
+All credits for the original idea go to them. While they laid the groundwork, this version focuses on dumb ai add ons and over engineered weather details 
 
 
 
@@ -35,15 +25,54 @@ modularity, and extensibility.
   local [YAMNet](https://www.kaggle.com/models/google/yamnet/tensorFlow2/yamnet/1?tfhub-redirect=true) ML model
 - When music is detected, identifies the song with [ShazamIO](https://github.com/shazamio/ShazamIO)
 - Displays song title, artist, and album cover on an e-ink display
-- Pressing Button A on the e-ink display adds the current song to a Spotify playlist
+- **Button A**: Adds the currently playing song to your Spotify playlist
   with [Spotipy](https://spotipy.readthedocs.io/en/2.25.1/)
-- When no music is detected for a while, the display switches to a screensaver mode that shows the weather
+- **Button B**: Toggles AI background generation on/off (switches between generated backgrounds and static fallback images)
+- **Button C**: Cycles through display orientations (portrait/landscape) and rotations
+- **AI-Generated Backgrounds**: Uses OpenAI's image generation to create weather-aware, time-of-day appropriate screensaver backgrounds
+- When no music is detected for a while, the display switches to a screensaver mode that shows the weather with dynamic or static backgrounds
+
+## 🎮 Button Controls
+
+### Button A - Add to Spotify Playlist
+When a song is playing, press Button A to add the current track to your configured Spotify playlist.
+
+### Button B - Toggle AI Background Mode
+Press Button B to toggle between AI-generated backgrounds and static fallback images for the screensaver:
+- **AI Mode ON** (default): Generates unique weather-aware backgrounds based on current conditions, time of day, and your configured style
+- **AI Mode OFF**: Uses static fallback images (day/night variants available)
+- A small red dot appears on the screensaver when in fallback mode
+- When re-enabling AI mode, a new background is immediately generated
+
+### Button C - Cycle Display Orientation
+Press Button C to cycle through all display orientation and rotation combinations:
+1. Portrait (90°)
+2. Portrait rotated (270°)
+3. Landscape (0°)
+4. Landscape rotated (180°)
+
+The display immediately redraws with the new orientation, and your preference is saved across reboots.
 
 ## ✨ What's New?
 
 
 
 
+
+### 🤖 OpenAI Integration
+
+- **Dynamic Background Generation**: Uses OpenAI's image generation API to create unique screensaver backgrounds
+- **Weather-Aware**: Incorporates current weather conditions, temperature, and location into the generated imagery
+- **Time-of-Day Adaptation**: Automatically adjusts lighting, color temperature, and scene elements based on:
+  - Daytime: Natural brightness, realistic shadows, balanced contrast
+  - Twilight: Soft low-angle light, gentle shadows, sky gradients
+  - Night: Low-light exposure, high contrast, artificial lighting (street lamps, illuminated windows)
+- **Astronomical Accuracy**: Calculates precise sun and moon positions to inform image generation
+- **Customizable Style**: Configure your preferred artistic style (e.g., "80s anime", "cyberpunk", "impressionist painting")
+- **Smart Caching**: Generated images are cached and refreshed on a configurable schedule (default: every 6 hours)
+- **Fallback Support**: Automatically falls back to static images if API is unavailable or disabled
+- **Model Flexibility**: Supports multiple OpenAI image models (DALL-E 2/3, GPT-Image variants)
+- **Orientation-Aware**: Generates images in the appropriate aspect ratio for your display orientation
 
 ### ♻️ Improvements
 
@@ -121,7 +150,7 @@ Since Raspberry Pi OS Lite is headless (no browser), you must authorize Spotify 
 1. On your computer, clone this repo:
 
 ```bash 
-  git clone https://github.com/maurocastermans/now-playing
+  git https://github.com/zombiecheese/now-playing
   cd now-playing
 ```
 
@@ -141,12 +170,12 @@ SSH into your Raspberry Pi:
 
 ```bash
   ssh <username>@<ip-address>
-```
+``
 
 And run:
 
 ```bash
-  wget https://raw.githubusercontent.com/maurocastermans/now-playing/main/setup.sh
+  wget https://raw.githubusercontent.com/zombiecheese/now-playing/main/setup.sh
   chmod +x setup.sh
   bash ./setup.sh
 ```
@@ -174,35 +203,99 @@ Should you encounter any errors, check [Known Issues](#-known-issues)
 > - Copies and configures a systemd service to autostart on boot
 > - Starts the now-playing service
 
-> 📂 <b>Resulting Config</b>
+> 📂 <b>Configuration File (config.yaml)</b>
+>
+> The `config.yaml` file controls all aspects of the application's behavior. Here's a comprehensive breakdown:
 >
 > ```yaml
 > display:
->   width: 600 # or 640 (4"), or 800 (7.3")
->   height: 448 # or 400 (4"), or 480 (7.3")
->   small_album_cover: true
->   small_album_cover_px: 250 # or 200 (4"), or 300 (7.3")
->   screensaver_image: "resources/default.jpg"
->   font_path: "resources/CircularStd-Bold.otf"
->   font_size_title: 45
->   font_size_subtitle: 35
->   offset_left_px: 20
->   offset_right_px: 20
->   offset_top_px: 0
->   offset_bottom_px: 20
->   offset_text_shadow_px: 4
+>   # Hardware settings
+>   width: 800                          # Display width in pixels (640 for 4", 600 for 5.7", 800 for 7.3")
+>   height: 480                         # Display height in pixels (400 for 4", 448 for 5.7", 480 for 7.3")
+>   
+>   # Font configuration
+>   font_path: "resources/CircularStd-Bold.otf"  # Path to font file
+>   font_size_title: 45                 # Font size for song title
+>   font_size_subtitle: 30              # Font size for artist name
+>   
+>   # Text positioning (per orientation)
+>   text_offset_left_px_landscape: 0    # Left margin for landscape mode
+>   text_offset_right_px_landscape: 0   # Right margin for landscape mode
+>   text_offset_top_px_landscape: 0     # Top margin for landscape mode
+>   text_offset_bottom_px_landscape: 0  # Bottom margin for landscape mode
+>   text_offset_text_shadow_px_landscape: 4  # Shadow offset for landscape
+>   
+>   text_offset_left_px_portrait: 5     # Left margin for portrait mode
+>   text_offset_right_px_portrait: 20   # Right margin for portrait mode
+>   text_offset_top_px_portrait: 0      # Top margin for portrait mode
+>   text_offset_bottom_px_portrait: 80  # Bottom margin for portrait mode
+>   text_offset_text_shadow_px_portrait: 4  # Shadow offset for portrait
+>   
+>   # Album art positioning (per orientation)
+>   album_offset_left_px_landscape: 0   # Album art left offset (landscape)
+>   album_offset_right_px_landscape: 0  # Album art right offset (landscape)
+>   album_offset_top_px_landscape: 0    # Album art top offset (landscape)
+>   album_offset_bottom_px_landscape: 0 # Album art bottom offset (landscape)
+>   
+>   album_offset_left_px_portrait: 0    # Album art left offset (portrait)
+>   album_offset_right_px_portrait: 14  # Album art right offset (portrait)
+>   album_offset_top_px_portrait: 49    # Album art top offset (portrait)
+>   album_offset_bottom_px_portrait: 0  # Album art bottom offset (portrait)
+>   
+>   # Visual styling
+>   backdrop_blur_radius: 12            # Blur radius for album backdrop (0 to disable)
+>   backdrop_darken_alpha: 120          # Backdrop darkening (0-255, 0 to disable)
+>   backdrop_use_gradient: false        # Use gradient instead of blurred image
+>   small_album_cover_px: 450           # Size of album cover in pixels
+>   
+>   # Background images
+>   weather_background_image: "resources/ai_screensaver.png"  # AI-generated background path
+>   portrait_album_background_color: "black"  # Background color behind album art in portrait
+>   
+>   # Text layout
+>   text_alignment_portrait: "center"   # Text alignment in portrait: "left"|"center"|"right"
+>   text_alignment_landscape: "left"    # Text alignment in landscape: "left"|"center"|"right"
+>   text_wrap_break_long_words: true    # Break long words if needed
+>   text_wrap_hyphenate: false          # Add hyphens at line breaks
+>   text_line_spacing_px: 4             # Extra spacing between wrapped lines
 > 
 > weather:
->   openweathermap_api_key: "YOUR_API_KEY"
->   geo_coordinates: "LAT,LON"
+>   openweathermap_api_key: "YOUR_API_KEY"     # Get from openweathermap.org
+>   geo_coordinates: "LAT,LON"                 # Format: "latitude,longitude"
+>   background_refresh_seconds: 3600            # How often to generate new backgrounds (seconds)
+>   timezone: "Australia/Melbourne"             # Your timezone for day/night calculation
 > 
 > spotify:
->   client_id: "YOUR_SPOTIFY_CLIENT_ID"
->   client_secret: "YOUR_SPOTIFY_CLIENT_SECRET"
->   playlist_id: "YOUR_SPOTIFY_PLAYLIST_ID"
+>   client_id: "YOUR_SPOTIFY_CLIENT_ID"        # From Spotify Developer Dashboard
+>   client_secret: "YOUR_SPOTIFY_CLIENT_SECRET" # From Spotify Developer Dashboard
+>   playlist_id: "YOUR_SPOTIFY_PLAYLIST_ID"    # Playlist to add songs to (Button A)
+> 
+> orchestrator:
+>   debounce_seconds: 30                # Skip re-render if same track within N seconds
+>   cache_ttl_seconds: 86400            # Keep album/year enrichment for 1 day
+>   cache_size: 512                     # Maximum cache entries
+>   cache_file_path: "cache/enrichment_cache.json"  # Optional disk persistence
 > 
 > log:
->   log_file_path: "log/now_playing.log"
+>   log_file_path: "log/now_playing.log"  # Application log file path
+> 
+> openai:
+>   api_key: "YOUR_OPENAI_API_KEY"      # Get from platform.openai.com
+>   prompt_style: "80s anime"            # Artistic style: "80s anime", "cyberpunk", "impressionist painting", etc.
+>   model: "gpt-image-1-mini"            # Model: "dall-e-2", "dall-e-3", "gpt-image-1.X"
+> 
+> image:
+>   orientation_strategy: "cover"       # How to fit images: "cover" or "contain"
+>   max_square_size: 1024               # Max dimension for square images (DALL-E 2 fallback)
+>   fallback_image_path_day: "resources/default_day.png"    # Daytime fallback image
+>   fallback_image_path_night: "resources/default_night.png" # Nighttime fallback image
+>   fallback_image_path: "resources/default.jpg"            # Generic fallback image
+> 
+> lighting:
+>   # These prompts inform the AI how to render lighting based on time of day
+>   day: "Use daytime lighting: natural brightness, appropriate color temperature, balanced contrast, and realistic shadows."
+>   twilight: "Use twilight lighting: soft low-angle light, gentle shadows, a sky gradient, moderate contrast, and selective artificial lights beginning to appear."
+>   night: "Render with low-light exposure: markedly darker scene, high contrast, cooler ambient tones, visible artificial lighting (street lamps, train interiors/headlights, illuminated windows), reduced sky luminance."
 > ```
 
 ## 🛠 Useful Commands
@@ -304,9 +397,13 @@ follow the instructions
 
 ## 🔮 What's Next?
 
-### More Button Actions
+### Button D
 
-There are still three unused buttons on the e-ink display. These could be mapped to additional features.
+Button D is currently unused and could be mapped to additional features such as:
+- Manual background refresh
+- Cycling through different AI art styles
+- Toggle between different weather data displays
+- Screenshot/save current display
 
 ### HTML Rendering
 
