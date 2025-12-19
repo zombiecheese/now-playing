@@ -135,11 +135,11 @@ display:
   # Fonts & layout
   font_path: "${install_path}/resources/CircularStd-Bold.otf"
   font_size_title: 45
-  font_size_subtitle: 35
-  offset_left_px: 20
-  offset_right_px: 20
+  font_size_subtitle: 30
+  offset_left_px: 5 #default for portrait ikea rodalm  stock mat
+  offset_right_px: 20 #default for portrait ikea rodalm  stock mat
   offset_top_px: 0
-  offset_bottom_px: 20
+  offset_bottom_px: 80 #default for portrait ikea rodalm stock mat
   offset_text_shadow_px: 4
 
   # Album Backdrop image styling
@@ -172,9 +172,10 @@ display:
   text_line_spacing_px: 4            # extra spacing between wrapped lines
 
 weather:
-  openweathermap_api_key: "${openweathermap_api_key}"
-  geo_coordinates: "${geo_coordinates}"
-  background_refresh_seconds: 900
+  openweathermap_api_key: "${openweathermap_api_key}" 
+  geo_coordinates: "${geo_coordinates}" # format: "latitude,longitude"
+  background_refresh_seconds: 3600 # refresh weather background every N seconds
+  timezone: "Australia/Melbourne" # for day/night determination
 
 spotify:
   client_id: "${spotify_client_id}"
@@ -190,15 +191,15 @@ orchestrator:
 openai:
   api_key: $openai_api_key
   prompt_style: "80s anime" # enter image style type (default is 80s anime)
-  model: "gpt-image-1"
+  model: "gpt-image-1"        # enter image model (default is gpt-image-1)
 
 image:
   orientation_strategy: "cover"   # "cover" or "contain"
   max_square_size: 1024           # used only for DALL-E 2 fallback
-
-  fallback_image_path_day: "/home/zombiecheese/now-playing/resources/default_day.png"
-  fallback_image_path_night: "/home/zombiecheese/now-playing/resources/default_night.png"
-  fallback_image_path: "/home/zombiecheese/now-playing/resources/default.jpg"
+  # Images to use when thing no worky
+  fallback_image_path_day: "${install_path}/resources/default_day.png"
+  fallback_image_path_night: "${install_path}/resources/default_night.png"
+  fallback_image_path: "${install_path}/resources/default.jpg"
 
 lighting:
   day: "Use daytime lighting: natural brightness, appropriate color temperature, balanced contrast, and realistic shadows."
