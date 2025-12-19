@@ -32,7 +32,21 @@ class SongIdentifyService:
                 self._logger.info("No song identified in the provided audio buffer.")
                 return None
             self._logger.info("Song identified in the provided audio buffer.")
-            return SongIdentifyService._parse_result(result)
+            song = SongIdentifyService._parse_result(result)
+            # Log detailed identified song information
+            try:
+                self._logger.info(
+                    "Identified song: Title=%s; Artist=%s; Album=%s; Year=%s; AlbumArt=%s",
+                    song.title or "",
+                    song.artist or "",
+                    song.album or "",
+                    song.release_year or "",
+                    song.album_art or ""
+                )
+            except Exception:
+                # Ensure logging doesn't break identification flow
+                self._logger.exception("Failed to log detailed song information.")
+            return song
         except Exception as ex:
             self._logger.error(f"Error identifying song: {ex}")
             return None
