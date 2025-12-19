@@ -65,11 +65,19 @@ class DisplayService:
 
         # Album art sizing / offsets
         self._album_cover_px = int(dcfg.get("small_album_cover_px", 250))
+        # Global/text offsets (used for text layout)
         self._offset_left_px = int(dcfg.get("offset_left_px", 20))
         self._offset_top_px = int(dcfg.get("offset_top_px", 0))
         self._offset_right_px = int(dcfg.get("offset_right_px", 20))
         self._offset_bottom_px = int(dcfg.get("offset_bottom_px", 20))
         self._offset_text_shadow_px = int(dcfg.get("offset_text_shadow_px", 0))
+
+        # Album-specific offsets (separate from text offsets). Fall back
+        # to the global offsets for backwards compatibility.
+        self._album_offset_left_px = int(dcfg.get("album_offset_left_px", 0))
+        self._album_offset_top_px = int(dcfg.get("album_offset_top_px",0))
+        self._album_offset_right_px = int(dcfg.get("album_offset_right_px", 0))
+        self._album_offset_bottom_px = int(dcfg.get("album_offset_bottom_px", 20))
 
         # Fonts (cached)
         self._font_title: ImageFont.FreeTypeFont
@@ -315,8 +323,9 @@ class DisplayService:
         cover = self._cover_image(album_img, self._album_cover_px)
 
         if self._orientation == "portrait":
+            # Use album-specific bottom offset when reserving space for text
             reserved_bottom = (
-                self._offset_bottom_px
+                self._album_offset_bottom_px
                 + self._font_title.size
                 + self._font_subtitle.size
                 + max(2, self._offset_text_shadow_px)
@@ -330,16 +339,24 @@ class DisplayService:
                 method=Image.LANCZOS,
                 centering=(0.5, 0.5),
             )
+
+            # Vertical placement: prefer configured album top offset but clamp
             y_top = min(
-                self._offset_top_px,
+                self._album_offset_top_px,
                 max(0, (canvas_h - reserved_bottom - square_size)),
             )
-            x_left = (canvas_w - square_size) // 2
+
+            # Horizontal placement: center by default, then apply any album left/right offsets
+            center_x = (canvas_w - square_size) // 2
+            x_left = center_x + (self._album_offset_left_px - self._album_offset_right_px)
+            # Clamp to visible canvas
+            x_left = max(0, min(x_left, max(0, canvas_w - square_size)))
+
             frame.paste(cover, (x_left, y_top), cover)
         else:
             # Landscape: simple left/top offsets; text goes at the bottom via _add_text()
-            x = self._offset_left_px
-            y = self._offset_top_px
+            x = self._album_offset_left_px
+            y = self._album_offset_top_px
             frame.paste(cover, (x, y), cover)
 
         return frame

@@ -142,6 +142,15 @@ display:
   offset_bottom_px: 80 #default for portrait ikea rodalm stock mat
   offset_text_shadow_px: 4
 
+  # Portrait album-specific offsets. When present these control album
+  # art placement independently from text/layout offsets above.
+  # Values are in pixels.
+  album_offset_left_px: 5
+  album_offset_right_px: 20
+  album_offset_top_px: 0
+  album_offset_bottom_px: 80
+
+
   # Album Backdrop image styling
   backdrop_blur_radius: 12
   backdrop_darken_alpha: 120 
