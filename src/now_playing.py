@@ -93,26 +93,14 @@ class NowPlaying:
         self._orientation: str = "portrait"
         self._portrait_rotate_degrees: int = 90
         self._landscape_rotate_degrees: int = 0
+        # Ensure toggle state file exists with defaults
+        self._ensure_toggle_state_file_exists()
         # Load persisted toggle state (if present)
         try:
             self._load_toggle_state_from_file()
         except Exception:
             pass
         self._toggle_state_mtime = self._get_toggle_state_mtime()
-
-        import inspect
-
-        # Confirm the method exists on the instance
-        self._logger.debug(
-            "Has refresh_background_if_needed: %s",
-            hasattr(self._ai_bg, "refresh_background_if_needed")
-        )
-
-        # Optional: list public attributes for a quick eyeball check
-        self._logger.debug(
-            "Public attrs: %s",
-            [a for a in dir(self._ai_bg) if not a.startswith("_")]
-        )
 
         # Initial housekeeping
         self._clean_display_and_set_clean_state()
@@ -312,26 +300,48 @@ class NowPlaying:
             self._logger.error(traceback.format_exc())
 
     def _handle_button_c(self) -> None:
-        """Toggle display orientation between portrait and landscape, then redraw the display."""
+        """Cycle through all combinations of orientation (portrait/landscape) and rotation (true/false)."""
         try:
-            # Toggle orientation
-            prev_orientation = self._orientation
-            self._orientation = "portrait" if self._orientation == "landscape" else "landscape"
+            # Determine current rotation state
+            current_rotation = (
+                (self._portrait_rotate_degrees == 270) if self._orientation == "portrait"
+                else (self._landscape_rotate_degrees == 180)
+            )
+            
+            # Cycle through states: portrait/false -> portrait/true -> landscape/false -> landscape/true -> back to start
+            if self._orientation == "portrait" and not current_rotation:
+                # State 1 -> 2: Portrait rotation False (90°) to True (270°)
+                self._portrait_rotate_degrees = 270
+                next_state = "portrait (rotated 270°)"
+            elif self._orientation == "portrait" and current_rotation:
+                # State 2 -> 3: Portrait rotation True to Landscape rotation False (0°)
+                self._orientation = "landscape"
+                self._landscape_rotate_degrees = 0
+                next_state = "landscape (rotated 0°)"
+            elif self._orientation == "landscape" and not current_rotation:
+                # State 3 -> 4: Landscape rotation False to True (180°)
+                self._landscape_rotate_degrees = 180
+                next_state = "landscape (rotated 180°)"
+            else:
+                # State 4 -> 1: Landscape rotation True to Portrait rotation False (90°)
+                self._orientation = "portrait"
+                self._portrait_rotate_degrees = 90
+                next_state = "portrait (rotated 90°)"
 
-            # Update the display service with the new orientation and current rotation settings
+            # Update the display service with the new orientation and rotation settings
             self._display_service.set_orientation(
                 self._orientation,
                 portrait_rotate_degrees=self._portrait_rotate_degrees,
                 landscape_rotate_degrees=self._landscape_rotate_degrees,
             )
             
-            # Persist the new orientation
+            # Persist the new orientation and rotation
             try:
                 self._save_toggle_state_to_file()
             except Exception as e:
                 self._logger.warning(f"Failed to persist orientation change: {e}")
             
-            self._logger.info(f"Display orientation changed: {prev_orientation} -> {self._orientation}")
+            self._logger.info(f"Display orientation/rotation changed to: {next_state}")
             
             # Redraw the current display with the new orientation
             current_state = self._state_manager.get_state().current
@@ -373,6 +383,25 @@ class NowPlaying:
         except Exception:
             pass
         return os.path.join(base, 'toggle_state.json')
+
+    def _ensure_toggle_state_file_exists(self) -> None:
+        """Create toggle_state.json with default values if it doesn't exist."""
+        path = self._state_file_path()
+        try:
+            if not os.path.exists(path):
+                self._logger.info(f"Creating toggle state file with defaults: {path}")
+                with open(path, 'w', encoding='utf-8') as f:
+                    json.dump(
+                        {
+                            'ai_bg_fallback_mode': True,
+                            'orientation': 'portrait',
+                            'rotation': False,
+                        },
+                        f,
+                        indent=4,
+                    )
+        except Exception as e:
+            self._logger.warning(f"Failed to create default toggle state file: {e}")
 
     def _get_toggle_state_mtime(self) -> Optional[float]:
         try:
