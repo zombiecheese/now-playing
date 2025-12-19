@@ -208,6 +208,10 @@ lighting:
 
 audio:
   recording_duration_seconds: 5 # Total duration to record for music detection/identification (max 10)
+  # When true, keep the in-memory buffer AND also write a debug WAV to disk
+  debugaudio: false
+  # Optional directory path to write debug WAV files. If omitted, uses ./debug_audio
+  debugaudio_path: "${install_path}/debug_audio"
 
 log:
   log_file_path: "${install_path}/log/now_playing.log" 
