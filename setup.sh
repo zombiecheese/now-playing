@@ -193,8 +193,14 @@ openai:
 image:
   orientation_strategy: "cover"   # "cover" or "contain"
   max_square_size: 1024           # used only for DALL-E 2 fallback
-  fallback_image_path_day: "${install_path}/resources/default_day.png"
-  fallback_image_path_night: "${install_path}/resources/default_night.png"
+
+  # Orientation + time-of-day specific fallbacks
+  fallback_image_path_day_portrait: "${install_path}/resources/portrait_default_day.png"
+  fallback_image_path_night_portrait: "${install_path}/resources/portrait_default_night.png"
+  fallback_image_path_day_landscape: "${install_path}/resources/landscape_default_day.png"
+  fallback_image_path_night_landscape: "${install_path}/resources/landscape_default_night.png"
+  
+  # Legacy single fallback
   fallback_image_path: "${install_path}/resources/default.jpg"
 
 lighting:

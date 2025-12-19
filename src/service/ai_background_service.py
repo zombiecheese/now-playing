@@ -69,10 +69,15 @@ class AIBackgroundService:
 
         self._api_key = openai_cfg.get("api_key") or os.environ.get("OPENAI_API_KEY") or ""
 
-        # support day/night-specific fallback images with legacy single-path as ultimate default
-        self._fallback_image_path_day = image_cfg.get("fallback_image_path_day") or ""
-        self._fallback_image_path_night = image_cfg.get("fallback_image_path_night") or ""
+        # Legacy single-path fallback (used when orientation-aware images are not configured)
         self._fallback_image_path = image_cfg.get("fallback_image_path") or ""
+
+        # Optional orientation-aware fallbacks (portrait/landscape for day/night)
+        # If present, these take precedence over generic day/night fallbacks.
+        self._fallback_image_path_day_portrait = image_cfg.get("fallback_image_path_day_portrait") or ""
+        self._fallback_image_path_day_landscape = image_cfg.get("fallback_image_path_day_landscape") or ""
+        self._fallback_image_path_night_portrait = image_cfg.get("fallback_image_path_night_portrait") or ""
+        self._fallback_image_path_night_landscape = image_cfg.get("fallback_image_path_night_landscape") or ""
 
         # Lighting strings from config (day/twilight/night). Keep default hard-coded fallback.
         self._lighting_cfg = lighting_cfg
@@ -138,6 +143,38 @@ class AIBackgroundService:
             self._ZoneInfo = ZoneInfo
         except Exception:
             self._ZoneInfo = None
+
+    def _get_current_orientation(self) -> str:
+        """
+        Return the current orientation, preferring config/toggle_state.json when present.
+        Falls back to the display config's orientation or "portrait".
+        """
+        orientation = (self._display_orientation or "portrait").lower()
+        try:
+            # This file lives in src/service; config folder is at project root: ../../config
+            cfg_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'config'))
+            ts_path = os.path.join(cfg_dir, 'toggle_state.json')
+            if os.path.exists(ts_path):
+                with open(ts_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    o = (data.get('orientation') or orientation or 'portrait').lower()
+                    if o in ("portrait", "landscape"):
+                        try:
+                            self._logger.debug("Orientation from toggle_state at %s: %s", ts_path, o)
+                        except Exception:
+                            pass
+                        return o
+            else:
+                try:
+                    self._logger.debug("toggle_state.json not found at %s; using default orientation '%s'", ts_path, orientation)
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self._logger.debug("Orientation read failed; using default '%s': %s", orientation, e)
+            except Exception:
+                pass
+        return orientation
 
     def _should_refresh(self) -> bool:
         """
@@ -322,7 +359,15 @@ class AIBackgroundService:
                 now_utc = datetime.datetime.now(datetime.timezone.utc)
                 sunrise_utc = datetime.datetime.utcfromtimestamp(sunrise_ts).replace(tzinfo=datetime.timezone.utc)
                 sunset_utc = datetime.datetime.utcfromtimestamp(sunset_ts).replace(tzinfo=datetime.timezone.utc)
-                return sunrise_utc <= now_utc <= sunset_utc
+                res = sunrise_utc <= now_utc <= sunset_utc
+                try:
+                    self._logger.debug(
+                        "Daytime check (UTC): now=%s sunrise=%s sunset=%s -> %s",
+                        now_utc, sunrise_utc, sunset_utc, res,
+                    )
+                except Exception:
+                    pass
+                return res
             # otherwise fall back to timezone/local heuristic below
         except Exception as e:
             self._logger.debug(f"Day/night check fallback: {type(e).__name__}: {e}")
@@ -342,7 +387,7 @@ class AIBackgroundService:
     def _choose_fallback_path(self) -> str:
         """
         Returns the best fallback image path in priority order:
-        1) day/night-specific path based on current time
+        1) orientation-aware day/night path based on current time and orientation
         2) legacy single 'fallback_image_path'
         3) empty string if none available
         """
@@ -353,14 +398,27 @@ class AIBackgroundService:
             # Default to day for safety; path presence is validated below.
             is_day = True
 
-        # Prefer specific paths when present
-        candidate = self._fallback_image_path_day if is_day else self._fallback_image_path_night
+        # Determine current orientation, preferring toggle_state.json if present
+        orientation = self._get_current_orientation()
+
+        # 1) Orientation-aware day/night specific paths
+        candidate = ""
+        if is_day:
+            candidate = (
+                self._fallback_image_path_day_portrait if orientation == "portrait" else self._fallback_image_path_day_landscape
+            )
+        else:
+            candidate = (
+                self._fallback_image_path_night_portrait if orientation == "portrait" else self._fallback_image_path_night_landscape
+            )
         if candidate:
             try:
-                self._logger.debug("Chosen fallback image (day=%s): %s", is_day, candidate)
+                self._logger.debug("Chosen orientation-aware fallback (day=%s, orientation=%s): %s", is_day, orientation, candidate)
             except Exception:
                 pass
             return candidate
+
+        # 2) Legacy single fallback
         try:
             self._logger.debug("Using legacy fallback image path: %s", self._fallback_image_path)
         except Exception:
@@ -423,7 +481,7 @@ class AIBackgroundService:
         # Honor configured display orientation by swapping width/height when needed
         w = int(self._display_width)
         h = int(self._display_height)
-        orient = (self._display_orientation or "").lower()
+        orient = (self._get_current_orientation() or self._display_orientation or "").lower()
         if orient.startswith("portrait") and w > h:
             w, h = h, w
         elif orient.startswith("landscape") and h > w:

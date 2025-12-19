@@ -106,10 +106,13 @@ class NowPlaying:
         self._clean_display_and_set_clean_state()
         self._setup_buttons()
         self._start_button_listener()
+        self._start_toggle_state_watcher()
 
     def run(self) -> None:
         while True:
             try:
+                # Always pick up external changes to toggle_state.json promptly
+                self._refresh_toggle_state_if_changed()
                 audio, is_music_detected = self._record_audio_and_detect_music()
                 if is_music_detected:
                     self._handle_music_detected(audio)
@@ -205,6 +208,37 @@ class NowPlaying:
         self._display_service.update_display_to_screensaver(weather_info, show_ai_dot=show_ai_dot, fallback_image_path=fallback_image_path)
         self._state_manager.increase_image_counter()
 
+    def _redraw_current_display(self) -> None:
+        try:
+            current_state = self._state_manager.get_state().current
+            if current_state == DisplayState.PLAYING:
+                playing_state = self._state_manager.get_playing_state()
+                from service.song_identify_service import SongInfo
+                song_info = SongInfo(
+                    title=playing_state.song_title,
+                    artist=playing_state.song_artist,
+                    album=None,
+                    release_year=None,
+                    album_art=None,
+                )
+                self._display_service.update_display_to_playing(song_info)
+            elif current_state == DisplayState.SCREENSAVER:
+                weather_info = self._weather_service.get_weather_info()
+                fallback_path = None
+                show_dot = False
+                try:
+                    if self._ai_bg_fallback_mode:
+                        fallback_path = self._ai_bg.get_fallback_path()
+                        if fallback_path:
+                            show_dot = True
+                except Exception:
+                    fallback_path = None
+                self._display_service.update_display_to_screensaver(
+                    weather_info, show_ai_dot=show_dot, fallback_image_path=fallback_path
+                )
+        except Exception as e:
+            self._logger.warning(f"Redraw after toggle_state change failed: {e}")
+
     # --- Buttons & housekeeping ---
     @staticmethod
     def _handle_exit(_sig, _frame):
@@ -235,6 +269,31 @@ class NowPlaying:
                         self._handle_button_c()
 
         threading.Thread(target=listen, daemon=True).start()
+
+    def _start_toggle_state_watcher(self) -> None:
+        def watch():
+            last = self._toggle_state_mtime
+            while True:
+                time.sleep(0.5)
+                try:
+                    current = self._get_toggle_state_mtime()
+                    if current is not None and current != last:
+                        self._logger.info("Toggle state change detected; applying immediately")
+                        self._load_toggle_state_from_file()
+                        last = current
+                        self._toggle_state_mtime = current
+                        if not self._ai_bg_fallback_mode:
+                            def worker_refresh():
+                                try:
+                                    self._ai_bg.refresh_background_if_needed()
+                                except Exception as e:
+                                    self._logger.warning(f"Background refresh after external toggle failed: {e}")
+                            threading.Thread(target=worker_refresh, daemon=True).start()
+                        self._redraw_current_display()
+                except Exception as e:
+                    self._logger.warning(f"Toggle state watcher error: {e}")
+
+        threading.Thread(target=watch, daemon=True).start()
 
     def _handle_button_a(self) -> None:
         """Add the currently playing track to the configured Spotify playlist."""

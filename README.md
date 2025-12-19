@@ -284,9 +284,15 @@ Should you encounter any errors, check [Known Issues](#-known-issues)
 > image:
 >   orientation_strategy: "cover"       # How to fit images: "cover" or "contain"
 >   max_square_size: 1024               # Max dimension for square images (DALL-E 2 fallback)
->   fallback_image_path_day: "resources/default_day.png"    # Daytime fallback image
->   fallback_image_path_night: "resources/default_night.png" # Nighttime fallback image
->   fallback_image_path: "resources/default.jpg"            # Generic fallback image
+>
+>   # Orientation + time-of-day specific fallbacks (preferred)
+>   fallback_image_path_day_portrait: "resources/portrait_default_day.png"
+>   fallback_image_path_night_portrait: "resources/portrait_default_night.png"
+>   fallback_image_path_day_landscape: "resources/landscape_default_day.png"
+>   fallback_image_path_night_landscape: "resources/landscape_default_night.png"
+>
+>   # Legacy single fallback (used if orientation-aware images are missing)
+>   fallback_image_path: "resources/default.jpg"
 > 
 > lighting:
 >   # These prompts inform the AI how to render lighting based on time of day
