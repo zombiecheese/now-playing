@@ -136,20 +136,22 @@ display:
   font_path: "${install_path}/resources/CircularStd-Bold.otf"
   font_size_title: 45
   font_size_subtitle: 30
-  offset_left_px: 5 #default for portrait ikea rodalm  stock mat
-  offset_right_px: 20 #default for portrait ikea rodalm  stock mat
+
+  #default for portrait ikea rodalm  stock mat
+  offset_left_px: 5 
+  offset_right_px: 20 
   offset_top_px: 0
-  offset_bottom_px: 80 #default for portrait ikea rodalm stock mat
+  offset_bottom_px: 80 
   offset_text_shadow_px: 4
 
   # Portrait album-specific offsets. When present these control album
   # art placement independently from text/layout offsets above.
   # Values are in pixels.
-  album_offset_left_px: 5
-  album_offset_right_px: 20
-  album_offset_top_px: 0
-  album_offset_bottom_px: 80
-
+  #default for portrait ikea rodalm stock mat
+  album_offset_left_px: 0
+  album_offset_right_px: 13
+  album_offset_top_px: 50
+  album_offset_bottom_px: 0
 
   # Album Backdrop image styling
   backdrop_blur_radius: 12
