@@ -149,8 +149,8 @@ display:
   # Values are in pixels.
   #default for portrait ikea rodalm stock mat
   album_offset_left_px: 0
-  album_offset_right_px: 13
-  album_offset_top_px: 50
+  album_offset_right_px: 14
+  album_offset_top_px: 49
   album_offset_bottom_px: 0
 
   # Album Backdrop image styling
