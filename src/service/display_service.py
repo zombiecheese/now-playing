@@ -45,8 +45,9 @@ class DisplayService:
 
         # Orientation & rotation (defaults; runtime overrides come from toggle_state)
         dcfg = self._config.get("display", {})
-        self._orientation = "portrait"
-        self._rotation = 90
+        self._orientation = "landscape"
+        self._portrait_rotate_degrees = 90
+        self._landscape_rotate_degrees = 0
 
         # Weather background (file path optional)
         self._weather_bg_path = dcfg.get("weather_background_image") or dcfg.get("screensaver_image")
@@ -146,7 +147,8 @@ class DisplayService:
     def set_orientation(
         self,
         orientation: str,
-        rotation: Optional[int] = None,
+        portrait_rotate_degrees: Optional[int] = None,
+        landscape_rotate_degrees: Optional[int] = None,
     ) -> None:
         """
         Dynamically change the display orientation and (optionally) rotation degrees.
@@ -159,14 +161,17 @@ class DisplayService:
             )
             return
 
-        if rotation is not None:
-            self._rotation = int(rotation)
+        if portrait_rotate_degrees is not None:
+            self._portrait_rotate_degrees = int(portrait_rotate_degrees)
+        if landscape_rotate_degrees is not None:
+            self._landscape_rotate_degrees = int(landscape_rotate_degrees)
 
         self._orientation = orientation
         self._logger.info(
-            "Orientation changed to %s (rotation=%s°)",
+            "Orientation changed to %s (portrait_rotate=%s, landscape_rotate=%s)",
             self._orientation,
-            self._rotation,
+            self._portrait_rotate_degrees,
+            self._landscape_rotate_degrees,
         )
 
     def update_display_to_playing(self, song_info: SongInfo) -> None:
@@ -263,9 +268,11 @@ class DisplayService:
         return (hw_w, hw_h)
 
     def _orient_for_hardware(self, image: Image.Image) -> Image.Image:
-        """Rotate canvas based on configured rotation degrees."""
-        if self._rotation:
-            return image.rotate(self._rotation, expand=False)
+        """Rotate canvas for portrait if configured."""
+        if self._orientation == "portrait":
+            return image.rotate(self._portrait_rotate_degrees, expand=True)
+        if self._landscape_rotate_degrees:
+            return image.rotate(self._landscape_rotate_degrees, expand=True)
         return image
 
     def _finalize_for_hardware(self, image: Image.Image) -> Image.Image:
