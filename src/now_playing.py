@@ -6,6 +6,7 @@ import json
 import numpy as np
 import traceback
 import signal
+import time
 from typing import Tuple, Final, Optional
 import gpiod
 import gpiodevice
@@ -87,6 +88,7 @@ class NowPlaying:
         self._ai_bg: AIBackgroundService = AIBackgroundService()
         # When True: force using AI background fallback images (no generation)
         self._ai_bg_fallback_mode: bool = False
+        self._toggle_state_mtime: Optional[float] = None
         # Display orientation (portrait or landscape) defaults; toggle_state overrides
         self._orientation: str = "portrait"
         self._portrait_rotate_degrees: int = 90
@@ -96,6 +98,7 @@ class NowPlaying:
             self._load_toggle_state_from_file()
         except Exception:
             pass
+        self._toggle_state_mtime = self._get_toggle_state_mtime()
 
         import inspect
 
@@ -115,6 +118,7 @@ class NowPlaying:
         self._clean_display_and_set_clean_state()
         self._setup_buttons()
         self._start_button_listener()
+        self._start_toggle_state_watcher()
 
     def run(self) -> None:
         while True:
@@ -369,6 +373,27 @@ class NowPlaying:
             pass
         return os.path.join(base, 'toggle_state.json')
 
+    def _get_toggle_state_mtime(self) -> Optional[float]:
+        try:
+            return os.path.getmtime(self._state_file_path())
+        except OSError:
+            return None
+
+    def _start_toggle_state_watcher(self, interval_seconds: int = 30) -> None:
+        def watch():
+            while True:
+                try:
+                    current_mtime = self._get_toggle_state_mtime()
+                    if current_mtime is not None and current_mtime != self._toggle_state_mtime:
+                        self._logger.info("Toggle state file changed; reloading")
+                        self._load_toggle_state_from_file()
+                        self._toggle_state_mtime = current_mtime
+                except Exception as e:
+                    self._logger.warning(f"Toggle state watcher error: {e}")
+                time.sleep(interval_seconds)
+
+        threading.Thread(target=watch, daemon=True).start()
+
     def _load_toggle_state_from_file(self) -> None:
         path = self._state_file_path()
         try:
@@ -413,6 +438,7 @@ class NowPlaying:
             except Exception:
                 # os.replace may not be atomic on some platforms; fallback to rename
                 os.rename(temp, path)
+            self._toggle_state_mtime = self._get_toggle_state_mtime()
             self._logger.debug(f"Persisted AI background fallback mode to {path}: {self._ai_bg_fallback_mode}")
         except Exception as e:
             self._logger.warning(f"Failed to persist toggle state to {path}: {e}")
