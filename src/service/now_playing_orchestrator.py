@@ -37,7 +37,8 @@ class NowPlayingOrchestrator:
         self._load_cache_from_disk()
 
     def process(self, audio_wav_buffer: io.BytesIO, force_update: bool = False) -> Optional[SongInfo]:
-        song_info = self._identify.identify(audio_wav_buffer)
+        # Use synchronous wrapper to invoke async identify
+        song_info = self._identify.identify_sync(audio_wav_buffer)
         if not song_info:
             return None
 
@@ -114,4 +115,10 @@ class NowPlayingOrchestrator:
             with open(self._cache_file_path, "w", encoding="utf-8") as f:
                 json.dump(data, f)
         except Exception:
+            # Log the failure but don't raise; persistence is non-fatal
+            try:
+                self._logger.exception("Failed to persist enrichment cache to disk.")
+            except Exception:
+                # Fallback: avoid raising from logger failures
+                pass
            

@@ -155,7 +155,8 @@ class NowPlaying:
             int16_audio,
             sampling_rate=NowPlaying.AUDIO_DEVICE_SAMPLING_RATE
         )
-        return self._song_identify_service.identify(wav_audio)
+        # Use the synchronous wrapper to call the async identify implementation
+        return self._song_identify_service.identify_sync(wav_audio)
 
     def _set_playing_state_and_update_display(self, song_info: SongInfo) -> None:
         if self._state_manager.should_clean_display():

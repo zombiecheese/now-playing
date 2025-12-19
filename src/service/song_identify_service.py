@@ -25,31 +25,53 @@ class SongIdentifyService:
         self._logger: logging.Logger = Logger().get_logger()
         self._shazam: Shazam = Shazam()
 
-    def identify(self, audio_wav_buffer: io.BytesIO) -> Optional[SongInfo]:
+    async def identify(self, audio_wav_buffer: io.BytesIO) -> Optional["SongInfo"]:
         try:
-            result = asyncio.run(self._shazam.recognize(audio_wav_buffer.read()))
+            # Ensure we read from the start of the buffer
+            audio_wav_buffer.seek(0)
+            audio_bytes = audio_wav_buffer.read()
+
+            # Use the modern Rust-backed API
+            result = await self._shazam.recognize(audio_bytes)
+
             if not result or "track" not in result:
                 self._logger.info("No song identified in the provided audio buffer.")
                 return None
+
             self._logger.info("Song identified in the provided audio buffer.")
             song = SongIdentifyService._parse_result(result)
-            # Log detailed identified song information
+
+            # Best-effort detailed logging
             try:
                 self._logger.info(
                     "Identified song: Title=%s; Artist=%s; Album=%s; Year=%s; AlbumArt=%s",
-                    song.title or "",
-                    song.artist or "",
-                    song.album or "",
-                    song.release_year or "",
-                    song.album_art or ""
+                    getattr(song, "title", "") or "",
+                    getattr(song, "artist", "") or "",
+                    getattr(song, "album", "") or "",
+                    getattr(song, "release_year", "") or "",
+                    getattr(song, "album_art", "") or "",
                 )
             except Exception:
-                # Ensure logging doesn't break identification flow
                 self._logger.exception("Failed to log detailed song information.")
+
             return song
+
         except Exception as ex:
-            self._logger.error(f"Error identifying song: {ex}")
+            self._logger.error("Error identifying song: %s", ex, exc_info=True)
             return None
+
+    def identify_sync(self, audio_wav_buffer: io.BytesIO) -> Optional["SongInfo"]:
+        """Synchronous wrapper for compatibility with existing callers.
+
+        Uses asyncio.run() to execute the async `identify` method when called
+        from synchronous code paths.
+        """
+        try:
+            return asyncio.run(self.identify(audio_wav_buffer))
+        except Exception as ex:
+            self._logger.error("Error identifying song (sync wrapper): %s", ex, exc_info=True)
+            return None
+
 
     @staticmethod
     def _parse_result(result: Optional[Dict]) -> SongInfo:
