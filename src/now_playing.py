@@ -91,8 +91,7 @@ class NowPlaying:
         self._toggle_state_mtime: Optional[float] = None
         # Display orientation (portrait or landscape) defaults; toggle_state overrides
         self._orientation: str = "portrait"
-        self._portrait_rotate_degrees: int = 90
-        self._landscape_rotate_degrees: int = 0
+        self._rotation: int = 0
         # Load persisted toggle state (if present)
         try:
             self._load_toggle_state_from_file()
@@ -320,8 +319,7 @@ class NowPlaying:
             # Update the display service with the new orientation and current rotation settings
             self._display_service.set_orientation(
                 self._orientation,
-                portrait_rotate_degrees=self._portrait_rotate_degrees,
-                landscape_rotate_degrees=self._landscape_rotate_degrees,
+                rotation=self._rotation,
             )
             
             # Persist the new orientation
@@ -402,19 +400,16 @@ class NowPlaying:
                     data = json.load(f)
                     self._ai_bg_fallback_mode = bool(data.get('ai_bg_fallback_mode', False))
                     self._orientation = (data.get('orientation') or self._orientation).lower()
-                    self._portrait_rotate_degrees = int(data.get('portrait_rotate_degrees', self._portrait_rotate_degrees))
-                    self._landscape_rotate_degrees = int(data.get('landscape_rotate_degrees', self._landscape_rotate_degrees))
+                    self._rotation = int(data.get('rotation', self._rotation))
                     self._display_service.set_orientation(
                         self._orientation,
-                        portrait_rotate_degrees=self._portrait_rotate_degrees,
-                        landscape_rotate_degrees=self._landscape_rotate_degrees,
+                        rotation=self._rotation,
                     )
                     self._logger.info(f"Loaded AI background fallback mode from {path}: {self._ai_bg_fallback_mode}")
                     self._logger.info(
-                        "Loaded display orientation=%s, portrait_rotate=%s, landscape_rotate=%s",
+                        "Loaded display orientation=%s, rotation=%s°",
                         self._orientation,
-                        self._portrait_rotate_degrees,
-                        self._landscape_rotate_degrees,
+                        self._rotation,
                     )
         except Exception as e:
             self._logger.warning(f"Failed to load toggle state from {path}: {e}")
@@ -428,8 +423,7 @@ class NowPlaying:
                     {
                         'ai_bg_fallback_mode': bool(self._ai_bg_fallback_mode),
                         'orientation': self._orientation,
-                        'portrait_rotate_degrees': self._portrait_rotate_degrees,
-                        'landscape_rotate_degrees': self._landscape_rotate_degrees,
+                        'rotation': self._rotation,
                     },
                     f,
                 )
