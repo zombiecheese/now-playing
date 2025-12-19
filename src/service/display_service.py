@@ -65,19 +65,30 @@ class DisplayService:
 
         # Album art sizing / offsets
         self._album_cover_px = int(dcfg.get("small_album_cover_px", 250))
-        # Global/text offsets (used for text layout)
-        self._offset_left_px = int(dcfg.get("offset_left_px", 20))
-        self._offset_top_px = int(dcfg.get("offset_top_px", 0))
-        self._offset_right_px = int(dcfg.get("offset_right_px", 20))
-        self._offset_bottom_px = int(dcfg.get("offset_bottom_px", 20))
-        self._offset_text_shadow_px = int(dcfg.get("offset_text_shadow_px", 0))
 
-        # Album-specific offsets (separate from text offsets). Fall back
-        # to the global offsets for backwards compatibility.
-        self._album_offset_left_px = int(dcfg.get("album_offset_left_px", 0))
-        self._album_offset_top_px = int(dcfg.get("album_offset_top_px",0))
-        self._album_offset_right_px = int(dcfg.get("album_offset_right_px", 0))
-        self._album_offset_bottom_px = int(dcfg.get("album_offset_bottom_px", 20))
+        # Text offsets per-orientation (remove global/shared offsets; default to 0)
+        self._text_offset_left_px_portrait = int(dcfg.get("text_offset_left_px_portrait", 0))
+        self._text_offset_right_px_portrait = int(dcfg.get("text_offset_right_px_portrait", 0))
+        self._text_offset_top_px_portrait = int(dcfg.get("text_offset_top_px_portrait", 0))
+        self._text_offset_bottom_px_portrait = int(dcfg.get("text_offset_bottom_px_portrait", 0))
+        self._text_offset_text_shadow_px_portrait = int(dcfg.get("text_offset_text_shadow_px_portrait", 0))
+
+        self._text_offset_left_px_landscape = int(dcfg.get("text_offset_left_px_landscape", 0))
+        self._text_offset_right_px_landscape = int(dcfg.get("text_offset_right_px_landscape", 0))
+        self._text_offset_top_px_landscape = int(dcfg.get("text_offset_top_px_landscape", 0))
+        self._text_offset_bottom_px_landscape = int(dcfg.get("text_offset_bottom_px_landscape", 0))
+        self._text_offset_text_shadow_px_landscape = int(dcfg.get("text_offset_text_shadow_px_landscape", 0))
+
+        # Album-specific offsets per-orientation (separate from text offsets). Default to 0
+        self._album_offset_left_px_portrait = int(dcfg.get("album_offset_left_px_portrait", 0))
+        self._album_offset_top_px_portrait = int(dcfg.get("album_offset_top_px_portrait", 0))
+        self._album_offset_right_px_portrait = int(dcfg.get("album_offset_right_px_portrait", 0))
+        self._album_offset_bottom_px_portrait = int(dcfg.get("album_offset_bottom_px_portrait", 0))
+
+        self._album_offset_left_px_landscape = int(dcfg.get("album_offset_left_px_landscape", 0))
+        self._album_offset_top_px_landscape = int(dcfg.get("album_offset_top_px_landscape", 0))
+        self._album_offset_right_px_landscape = int(dcfg.get("album_offset_right_px_landscape", 0))
+        self._album_offset_bottom_px_landscape = int(dcfg.get("album_offset_bottom_px_landscape", 0))
 
         # Fonts (cached)
         self._font_title: ImageFont.FreeTypeFont
@@ -243,6 +254,73 @@ class DisplayService:
         )
 
     # ---------------------------------------------------------------------
+    # Offset helpers (per-orientation)
+    # ---------------------------------------------------------------------
+
+    def _get_text_offset_left_px(self) -> int:
+        return (
+            self._text_offset_left_px_portrait
+            if self._orientation == "portrait"
+            else self._text_offset_left_px_landscape
+        )
+
+    def _get_text_offset_right_px(self) -> int:
+        return (
+            self._text_offset_right_px_portrait
+            if self._orientation == "portrait"
+            else self._text_offset_right_px_landscape
+        )
+
+    def _get_text_offset_top_px(self) -> int:
+        return (
+            self._text_offset_top_px_portrait
+            if self._orientation == "portrait"
+            else self._text_offset_top_px_landscape
+        )
+
+    def _get_text_offset_bottom_px(self) -> int:
+        return (
+            self._text_offset_bottom_px_portrait
+            if self._orientation == "portrait"
+            else self._text_offset_bottom_px_landscape
+        )
+
+    def _get_text_shadow_px(self) -> int:
+        return (
+            self._text_offset_text_shadow_px_portrait
+            if self._orientation == "portrait"
+            else self._text_offset_text_shadow_px_landscape
+        )
+
+    def _get_album_offset_left_px(self) -> int:
+        return (
+            self._album_offset_left_px_portrait
+            if self._orientation == "portrait"
+            else self._album_offset_left_px_landscape
+        )
+
+    def _get_album_offset_right_px(self) -> int:
+        return (
+            self._album_offset_right_px_portrait
+            if self._orientation == "portrait"
+            else self._album_offset_right_px_landscape
+        )
+
+    def _get_album_offset_top_px(self) -> int:
+        return (
+            self._album_offset_top_px_portrait
+            if self._orientation == "portrait"
+            else self._album_offset_top_px_landscape
+        )
+
+    def _get_album_offset_bottom_px(self) -> int:
+        return (
+            self._album_offset_bottom_px_portrait
+            if self._orientation == "portrait"
+            else self._album_offset_bottom_px_landscape
+        )
+
+    # ---------------------------------------------------------------------
     # Composition
     # ---------------------------------------------------------------------
 
@@ -325,10 +403,10 @@ class DisplayService:
         if self._orientation == "portrait":
             # Use album-specific bottom offset when reserving space for text
             reserved_bottom = (
-                self._album_offset_bottom_px
+                self._get_album_offset_bottom_px()
                 + self._font_title.size
                 + self._font_subtitle.size
-                + max(2, self._offset_text_shadow_px)
+                + max(2, self._get_text_shadow_px())
                 + max(0, self._line_spacing_px)
             )
             usable_h = max(0, canvas_h - reserved_bottom)
@@ -342,21 +420,21 @@ class DisplayService:
 
             # Vertical placement: prefer configured album top offset but clamp
             y_top = min(
-                self._album_offset_top_px,
+                self._get_album_offset_top_px(),
                 max(0, (canvas_h - reserved_bottom - square_size)),
             )
 
             # Horizontal placement: center by default, then apply any album left/right offsets
             center_x = (canvas_w - square_size) // 2
-            x_left = center_x + (self._album_offset_left_px - self._album_offset_right_px)
+            x_left = center_x + (self._get_album_offset_left_px() - self._get_album_offset_right_px())
             # Clamp to visible canvas
             x_left = max(0, min(x_left, max(0, canvas_w - square_size)))
 
             frame.paste(cover, (x_left, y_top), cover)
         else:
             # Landscape: simple left/top offsets; text goes at the bottom via _add_text()
-            x = self._album_offset_left_px
-            y = self._album_offset_top_px
+            x = self._get_album_offset_left_px()
+            y = self._get_album_offset_top_px()
             frame.paste(cover, (x, y), cover)
 
         return frame
@@ -434,7 +512,7 @@ class DisplayService:
         alignment = self._get_alignment()
 
         # Optional meta line (draws first; appears lowest on screen after stacking)
-        meta_position_y = canvas_h - (self._offset_bottom_px + self._font_subtitle.size)
+        meta_position_y = canvas_h - (self._get_text_offset_bottom_px() + self._font_subtitle.size)
         meta_block_h = 0
         if meta:
             meta_block_h = self._draw_text(
@@ -450,7 +528,7 @@ class DisplayService:
         # Subtitle (e.g., artist or Temp � Feels like)
         subtitle_position_y = (
             canvas_h
-            - (self._offset_bottom_px + self._font_subtitle.size)
+            - (self._get_text_offset_bottom_px() + self._font_subtitle.size)
             - meta_block_h
         )
         subtitle_block_h = self._draw_text(
@@ -466,7 +544,7 @@ class DisplayService:
         # Title (e.g., song title or weather description)
         title_position_y = (
             canvas_h
-            - (self._offset_bottom_px + self._font_title.size)
+            - (self._get_text_offset_bottom_px() + self._font_title.size)
             - meta_block_h
             - subtitle_block_h
         )
@@ -493,9 +571,9 @@ class DisplayService:
         # Available width considers left/right offsets and shadow shift
         available_width = (
             canvas_w
-            - self._offset_left_px
-            - self._offset_right_px
-            - self._offset_text_shadow_px
+            - self._get_text_offset_left_px()
+            - self._get_text_offset_right_px()
+            - self._get_text_shadow_px()
         )
         lines = self._break_text_to_lines_advanced(
             text=text,
@@ -516,16 +594,16 @@ class DisplayService:
         for line in lines:
             line_w = int(draw.textlength(line, font=font))
             if alignment == "center":
-                x = self._offset_left_px + max(0, (available_width - line_w) // 2)
+                x = self._get_text_offset_left_px() + max(0, (available_width - line_w) // 2)
             elif alignment == "right":
-                x = canvas_w - self._offset_right_px - line_w
+                x = canvas_w - self._get_text_offset_right_px() - line_w
             else:
-                x = self._offset_left_px
+                x = self._get_text_offset_left_px()
 
             # Optional soft shadow (down-right)
-            if self._offset_text_shadow_px > 0:
+            if self._get_text_shadow_px() > 0:
                 draw.text(
-                    (x + self._offset_text_shadow_px, draw_position_y + self._offset_text_shadow_px),
+                    (x + self._get_text_shadow_px(), draw_position_y + self._get_text_shadow_px()),
                     line,
                     font=font,
                     fill="black",

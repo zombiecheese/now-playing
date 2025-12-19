@@ -137,21 +137,32 @@ display:
   font_size_title: 45
   font_size_subtitle: 30
 
-  #default for portrait ikea rodalm  stock mat
-  offset_left_px: 5 
-  offset_right_px: 20 
-  offset_top_px: 0
-  offset_bottom_px: 80 
-  offset_text_shadow_px: 4
+  # Text offsets per-orientation (all default to 0 if omitted)
+  text_offset_left_px_landscape: 0
+  text_offset_right_px_landscape: 0
+  text_offset_top_px_landscape: 0
+  text_offset_bottom_px_landscape: 0
+  text_offset_text_shadow_px_landscape: 4
 
-  # Portrait album-specific offsets. When present these control album
-  # art placement independently from text/layout offsets above.
-  # Values are in pixels.
-  #default for portrait ikea rodalm stock mat
-  album_offset_left_px: 0
-  album_offset_right_px: 14
-  album_offset_top_px: 49
-  album_offset_bottom_px: 0
+  Portrait - defaults to ikea rodalm mat window
+  text_offset_left_px_portrait: 5
+  text_offset_right_px_portrait: 20
+  text_offset_top_px_portrait: 0
+  text_offset_bottom_px_portrait: 80
+  text_offset_text_shadow_px_portrait: 4
+
+  # Album art offsets per-orientation (all default to 0 if omitted)
+  # Landscape
+  album_offset_left_px_landscape: 0
+  album_offset_right_px_landscape: 0
+  album_offset_top_px_landscape: 0
+  album_offset_bottom_px_landscape: 0
+
+  # Portrait - defaults to ikea rodalm mat window
+  album_offset_left_px_portrait: 0
+  album_offset_right_px_portrait: 14
+  album_offset_top_px_portrait: 49
+  album_offset_bottom_px_portrait: 0
 
   # Album Backdrop image styling
   backdrop_blur_radius: 12
@@ -199,15 +210,17 @@ orchestrator:
   cache_size: 512               # max enrichment entries
   cache_file_path: "${install_path}/cache/enrichment_cache.json"  # optional; omit to disable disk persistence
 
+log:
+  log_file_path: "${install_path}/log/now_playing.log"
+
 openai:
   api_key: $openai_api_key
-  prompt_style: "80s anime" # enter image style type (default is 80s anime)
-  model: "gpt-image-1"        # enter image model (default is gpt-image-1)
+  prompt_style: "80s anime" # e.g., "80s anime", "cyberpunk", "impressionist painting"
+  model: "gpt-image-1" # "dall-e-2/3","gpt-image-1.X"
 
 image:
   orientation_strategy: "cover"   # "cover" or "contain"
   max_square_size: 1024           # used only for DALL-E 2 fallback
-  # Images to use when thing no worky
   fallback_image_path_day: "${install_path}/resources/default_day.png"
   fallback_image_path_night: "${install_path}/resources/default_night.png"
   fallback_image_path: "${install_path}/resources/default.jpg"
@@ -219,16 +232,9 @@ lighting:
 
 audio:
   recording_duration_seconds: 5 # Total duration to record for music detection/identification (max 10)
-  # When true, keep the in-memory buffer AND also write a debug WAV to disk
   debugaudio: false
-  # Optional directory path to write debug WAV files. If omitted, uses ./debug_audio
   debugaudio_path: "${install_path}/debug_audio"
-  # Optional gain (in dB) to apply to recorded audio. 0.0 = no change.
-  # Positive values amplify, negative attenuate.
   gain_db: 0.0
-
-log:
-  log_file_path: "${install_path}/log/now_playing.log" 
 
 EOF
 echo "✔ Configuration file created at ${install_path}/config/config.yaml."
