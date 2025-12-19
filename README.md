@@ -56,9 +56,6 @@ The display immediately redraws with the new orientation, and your preference is
 ## ✨ What's New?
 
 
-
-
-
 ### 🤖 OpenAI Integration
 
 - **Dynamic Background Generation**: Uses OpenAI's image generation API to create unique screensaver backgrounds
@@ -314,7 +311,31 @@ After editing, restart the service to apply changes:
   sudo systemctl restart now-playing.service
 ```
 
-### 🔁 Systemd Service
+### � Update Script
+
+The `update.sh` script makes updating your installation simple and safe:
+
+```bash
+  bash update.sh
+```
+
+**What it does:**
+- Stops the now-playing service
+- Fetches the latest code from the GitHub repository
+- Resets your installation to the latest version (preserves your config files)
+- Updates Python dependencies to their latest versions
+- Prompts you to restart the service
+
+**Important Notes:**
+- Your `config/config.yaml` and `.cache` files are preserved
+- Must be run as a regular user (not root)
+- Requires an active internet connection
+- After completion, manually restart the service:
+  ```bash
+  sudo systemctl start now-playing
+  ```
+
+### �🔁 Systemd Service
 
 - Check status:
 
@@ -352,6 +373,96 @@ To leave the virtual environment:
 
 ```bash
   deactivate
+```
+
+## 🎨 Fine-Tuning Display Layout
+
+The `config.yaml` file provides extensive control over text and image positioning, allowing you to perfectly align elements for your specific display and aesthetic preferences.
+
+### Text Offset Configuration
+
+Text offsets control the margins and shadow effects for song information. Configure separately for each orientation:
+
+**Landscape Mode:**
+```yaml
+text_offset_left_px_landscape: 0      # Distance from left edge
+text_offset_right_px_landscape: 0     # Distance from right edge
+text_offset_top_px_landscape: 0       # Distance from top
+text_offset_bottom_px_landscape: 0    # Distance from bottom
+text_offset_text_shadow_px_landscape: 4  # Shadow depth for text readability
+```
+
+**Portrait Mode:**
+```yaml
+text_offset_left_px_portrait: 5       # Distance from left edge
+text_offset_right_px_portrait: 20     # Distance from right edge
+text_offset_top_px_portrait: 0        # Distance from top
+text_offset_bottom_px_portrait: 80    # Distance from bottom
+text_offset_text_shadow_px_portrait: 4   # Shadow depth for text readability
+```
+
+### Album Art Offset Configuration
+
+Album art offsets allow precise positioning of the album cover image:
+
+**Landscape Mode:**
+```yaml
+album_offset_left_px_landscape: 0     # Move album art left/right
+album_offset_right_px_landscape: 0    # Adjust right-side spacing
+album_offset_top_px_landscape: 0      # Move album art up/down
+album_offset_bottom_px_landscape: 0   # Adjust bottom spacing
+```
+
+**Portrait Mode:**
+```yaml
+album_offset_left_px_portrait: 0      # Move album art left/right
+album_offset_right_px_portrait: 14    # Adjust right-side spacing
+album_offset_top_px_portrait: 49      # Move album art up/down
+album_offset_bottom_px_portrait: 0    # Adjust bottom spacing
+```
+
+### Tuning Tips
+
+1. **Start Small**: Make incremental changes (5-10px at a time) to avoid overshooting
+2. **Test Both Orientations**: Remember to check both portrait and landscape modes
+3. **Consider Text Length**: Longer song titles may need different offset values
+4. **Shadow Depth**: Increase `text_offset_text_shadow_px` for better readability on busy backgrounds
+5. **Live Testing**: After editing config, restart the service and wait for a song to play:
+   ```bash
+   sudo systemctl restart now-playing.service
+   journalctl -u now-playing.service --follow
+   ```
+
+### Text Alignment Options
+
+In addition to offsets, you can control text alignment:
+
+```yaml
+text_alignment_portrait: "center"    # Options: "left", "center", "right"
+text_alignment_landscape: "left"     # Options: "left", "center", "right"
+```
+
+### Common Layout Scenarios
+
+**Centered Layout (Portrait):**
+```yaml
+text_alignment_portrait: "center"
+text_offset_left_px_portrait: 20
+text_offset_right_px_portrait: 20
+text_offset_bottom_px_portrait: 40
+```
+
+**Left-Aligned with Album on Right (Landscape):**
+```yaml
+text_alignment_landscape: "left"
+text_offset_left_px_landscape: 20
+album_offset_right_px_landscape: 20
+```
+
+**Bottom-Aligned Text (Portrait):**
+```yaml
+text_offset_bottom_px_portrait: 100   # Push text to bottom
+album_offset_top_px_portrait: 20      # Album at top
 ```
 
 ## 🐛 Known Issues
@@ -397,6 +508,7 @@ follow the instructions
 
 ## 🔮 What's Next?
 
+
 ### Button D
 
 Button D is currently unused and could be mapped to additional features such as:
@@ -404,6 +516,11 @@ Button D is currently unused and could be mapped to additional features such as:
 - Cycling through different AI art styles
 - Toggle between different weather data displays
 - Screenshot/save current display
+
+### Button 
+
+Better handling of offsets during rotations!
+
 
 ### HTML Rendering
 
