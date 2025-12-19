@@ -118,7 +118,6 @@ class NowPlaying:
         self._clean_display_and_set_clean_state()
         self._setup_buttons()
         self._start_button_listener()
-        self._start_toggle_state_watcher()
 
     def run(self) -> None:
         while True:
@@ -167,6 +166,7 @@ class NowPlaying:
         return self._song_identify_service.identify_sync(wav_audio)
 
     def _set_playing_state_and_update_display(self, song_info: SongInfo) -> None:
+        self._refresh_toggle_state_if_changed()
         if self._state_manager.should_clean_display():
             self._clean_display_and_set_clean_state()
         self._state_manager.set_playing_state(song_info.title, song_info.artist)
@@ -209,6 +209,7 @@ class NowPlaying:
             self._set_screensaver_state_and_update_display(weather_info, show_ai_dot=show_dot, fallback_image_path=fallback_path)
 
     def _set_screensaver_state_and_update_display(self, weather_info: WeatherInfo, show_ai_dot: bool = False, fallback_image_path: Optional[str] = None) -> None:
+        self._refresh_toggle_state_if_changed()
         if self._state_manager.should_clean_display():
             self._clean_display_and_set_clean_state()
         self._state_manager.set_screensaver_state(weather_info)
@@ -379,20 +380,16 @@ class NowPlaying:
         except OSError:
             return None
 
-    def _start_toggle_state_watcher(self, interval_seconds: int = 30) -> None:
-        def watch():
-            while True:
-                try:
-                    current_mtime = self._get_toggle_state_mtime()
-                    if current_mtime is not None and current_mtime != self._toggle_state_mtime:
-                        self._logger.info("Toggle state file changed; reloading")
-                        self._load_toggle_state_from_file()
-                        self._toggle_state_mtime = current_mtime
-                except Exception as e:
-                    self._logger.warning(f"Toggle state watcher error: {e}")
-                time.sleep(interval_seconds)
-
-        threading.Thread(target=watch, daemon=True).start()
+    def _refresh_toggle_state_if_changed(self) -> None:
+        """Reload toggle_state.json if it changed since last load/save."""
+        try:
+            current_mtime = self._get_toggle_state_mtime()
+            if current_mtime is not None and current_mtime != self._toggle_state_mtime:
+                self._logger.info("Toggle state file changed; reloading")
+                self._load_toggle_state_from_file()
+                self._toggle_state_mtime = current_mtime
+        except Exception as e:
+            self._logger.warning(f"Toggle state refresh error: {e}")
 
     def _load_toggle_state_from_file(self) -> None:
         path = self._state_file_path()
@@ -402,8 +399,40 @@ class NowPlaying:
                     data = json.load(f)
                     self._ai_bg_fallback_mode = bool(data.get('ai_bg_fallback_mode', False))
                     self._orientation = (data.get('orientation') or self._orientation).lower()
-                    self._portrait_rotate_degrees = int(data.get('portrait_rotate_degrees', self._portrait_rotate_degrees))
-                    self._landscape_rotate_degrees = int(data.get('landscape_rotate_degrees', self._landscape_rotate_degrees))
+
+                    # Consolidated rotation structure: a single bool or legacy per-orientation values.
+                    # Booleans: portrait True/False -> 90/270; landscape True/False -> 0/180.
+                    rotation_raw = data.get('rotation')
+
+                    def _decode_rotation_value(raw_value: object, orientation: str, default_degrees: int) -> int:
+                        if isinstance(raw_value, bool):
+                            return 270 if (raw_value and orientation == "portrait") else (
+                                90 if orientation == "portrait" else (180 if raw_value else 0)
+                            )
+                        try:
+                            return int(raw_value)
+                        except Exception:
+                            return default_degrees
+
+                    if isinstance(rotation_raw, bool):
+                        # Single bool drives both orientations
+                        self._portrait_rotate_degrees = _decode_rotation_value(rotation_raw, 'portrait', self._portrait_rotate_degrees)
+                        self._landscape_rotate_degrees = _decode_rotation_value(rotation_raw, 'landscape', self._landscape_rotate_degrees)
+                    else:
+                        portrait_raw = rotation_raw.get('portrait') if isinstance(rotation_raw, dict) else rotation_raw
+                        landscape_raw = rotation_raw.get('landscape') if isinstance(rotation_raw, dict) else rotation_raw
+
+                        self._portrait_rotate_degrees = _decode_rotation_value(
+                            portrait_raw if portrait_raw is not None else data.get('portrait_rotate_degrees'),
+                            'portrait',
+                            self._portrait_rotate_degrees,
+                        )
+                        self._landscape_rotate_degrees = _decode_rotation_value(
+                            landscape_raw if landscape_raw is not None else data.get('landscape_rotate_degrees'),
+                            'landscape',
+                            self._landscape_rotate_degrees,
+                        )
+
                     self._display_service.set_orientation(
                         self._orientation,
                         portrait_rotate_degrees=self._portrait_rotate_degrees,
@@ -424,12 +453,22 @@ class NowPlaying:
         try:
             temp = path + '.tmp'
             with open(temp, 'w', encoding='utf-8') as f:
+                def _encode_rotation_bool(p_deg: int, l_deg: int) -> bool:
+                    p_bool = True if p_deg == 270 else False if p_deg == 0 else None
+                    l_bool = True if l_deg == 180 else False if l_deg == 0 else None
+                    if p_bool is not None and l_bool is not None and p_bool == l_bool:
+                        return p_bool
+                    if p_bool is not None:
+                        return p_bool
+                    if l_bool is not None:
+                        return l_bool
+                    return True  # fallback
+
                 json.dump(
                     {
                         'ai_bg_fallback_mode': bool(self._ai_bg_fallback_mode),
                         'orientation': self._orientation,
-                        'portrait_rotate_degrees': self._portrait_rotate_degrees,
-                        'landscape_rotate_degrees': self._landscape_rotate_degrees,
+                        'rotation': _encode_rotation_bool(self._portrait_rotate_degrees, self._landscape_rotate_degrees),
                     },
                     f,
                 )

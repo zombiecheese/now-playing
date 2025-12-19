@@ -105,27 +105,6 @@ case $display_size_choice in
     ;;
 esac
 
-echo "Select your Inky Impression display orientation:"
-echo "1) portrait"
-echo "2) landscape"
-
-
-read -r -p "Enter choice (1/2/3): " display_size_choice
-
-case $display_size_choice in
-  1)
-    orientation=portrait
-    ;;
-  2)
-    orientation=landscape
-    ;;
-  *)
-    echo "Invalid choice. Defaulting to portrait."
-    orientation=portrait
-    ;;
-esac
-
-
 cat <<EOF > "${install_path}/config/config.yaml"
 display:
   # Physical hardware buffer for your Inky device
