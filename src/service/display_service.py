@@ -45,8 +45,8 @@ class DisplayService:
 
         # Orientation & rotation (defaults; runtime overrides come from toggle_state)
         dcfg = self._config.get("display", {})
-        self._orientation = "landscape"
-        self._rotation = 0
+        self._orientation = "portrait"
+        self._rotation = 90
 
         # Weather background (file path optional)
         self._weather_bg_path = dcfg.get("weather_background_image") or dcfg.get("screensaver_image")
