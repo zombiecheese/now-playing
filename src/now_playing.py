@@ -189,12 +189,10 @@ class NowPlaying:
             weather_info = self._weather_service.get_weather_info()
             # Determine whether to force a time-relevant fallback image and show the indicator dot
             fallback_path = None
-            show_dot = False
+            show_dot = self._ai_bg_fallback_mode
             try:
                 if self._ai_bg_fallback_mode:
                     fallback_path = self._ai_bg.get_fallback_path()
-                    if fallback_path:
-                        show_dot = True
             except Exception:
                 fallback_path = None
             self._set_screensaver_state_and_update_display(weather_info, show_ai_dot=show_dot, fallback_image_path=fallback_path)
@@ -421,12 +419,10 @@ class NowPlaying:
                 # Redraw the screensaver with current weather
                 weather_info = self._weather_service.get_weather_info()
                 fallback_path = None
-                show_dot = False
+                show_dot = self._ai_bg_fallback_mode
                 try:
                     if self._ai_bg_fallback_mode:
                         fallback_path = self._ai_bg.get_fallback_path()
-                        if fallback_path:
-                            show_dot = True
                 except Exception:
                     fallback_path = None
                 self._display_service.update_display_to_screensaver(weather_info, show_ai_dot=show_dot, fallback_image_path=fallback_path)

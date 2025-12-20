@@ -720,7 +720,7 @@ class DisplayService:
                 try:
                     draw = ImageDraw.Draw(image)
                     # small, clearly visible dot with a modest margin
-                    margin = max(4, min(image.size) // 64)
+                    margin = max(10, min(image.size) // 64)
                     radius = max(3, min(image.size) // 80)
                     x0 = margin
                     y0 = margin
