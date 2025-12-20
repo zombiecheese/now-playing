@@ -10,12 +10,12 @@ class Logger(metaclass=SingletonMeta):
         self._logger: logging.Logger = logging.getLogger('now_playing_logger')
         self._config: dict = Config().get_config()
 
-        # Overall logging level
-        self._logger.setLevel(logging.DEBUG)
+        # Overall logging level (suppress DEBUG by default)
+        self._logger.setLevel(logging.INFO)
 
         # Stream handler for console logging
         stdout_handler = logging.StreamHandler(sys.stdout)
-        stdout_handler.setLevel(logging.DEBUG)
+        stdout_handler.setLevel(logging.INFO)
         stdout_handler.setFormatter(logging.Formatter('%(asctime)s :: %(levelname)s :: %(message)s'))
         self._logger.addHandler(stdout_handler)
 

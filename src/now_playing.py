@@ -190,10 +190,13 @@ class NowPlaying:
             # Determine whether to force a time-relevant fallback image and show the indicator dot
             fallback_path = None
             show_dot = self._ai_bg_fallback_mode
+            self._logger.info(f"AI fallback mode: {self._ai_bg_fallback_mode}, show_dot: {show_dot}")
             try:
                 if self._ai_bg_fallback_mode:
                     fallback_path = self._ai_bg.get_fallback_path()
-            except Exception:
+                    self._logger.info(f"AI fallback path: {fallback_path}")
+            except Exception as e:
+                self._logger.warning(f"Failed to get AI fallback path: {e}")
                 fallback_path = None
             self._set_screensaver_state_and_update_display(weather_info, show_ai_dot=show_dot, fallback_image_path=fallback_path)
 
@@ -203,6 +206,7 @@ class NowPlaying:
             self._clean_display_and_set_clean_state()
         self._state_manager.set_screensaver_state(weather_info)
         # Pass through whether to render the small red dot and an optional fallback image override
+        self._logger.info(f"Updating screensaver display: show_ai_dot={show_ai_dot}, fallback_image_path={fallback_image_path}")
         self._display_service.update_display_to_screensaver(weather_info, show_ai_dot=show_ai_dot, fallback_image_path=fallback_image_path)
         self._state_manager.increase_image_counter()
 

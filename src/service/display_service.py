@@ -719,11 +719,20 @@ class DisplayService:
             if show_ai_dot:
                 try:
                     draw = ImageDraw.Draw(image)
-                    # small, clearly visible dot with a modest margin
-                    margin = max(10, min(image.size) // 64)
-                    radius = max(3, min(image.size) // 80)
-                    x0 = margin
-                    y0 = margin
+                    # Margins scale with aspect ratio and orientation
+                    w, h = image.size
+                    short = min(w, h)
+                    # Base margin is a small percentage of the shorter edge
+                    base_margin = int(short * 0.10)  # ~3%
+                    # Axis-specific margins scale by how each axis compares to the shorter edge
+                    margin_x = max(16, int(base_margin * (w / short)))
+                    margin_y = max(16, int(base_margin * (h / short)))
+
+                    # Radius scales with shorter edge to remain consistent visually
+                    radius = max(10, short // 80)
+
+                    x0 = margin_x
+                    y0 = margin_y
                     x1 = x0 + (radius * 2)
                     y1 = y0 + (radius * 2)
                     draw.ellipse((x0, y0, x1, y1), fill=(255, 0, 0))
