@@ -49,6 +49,10 @@ class DisplayService:
         self._portrait_rotate_degrees = 90
         self._landscape_rotate_degrees = 0
 
+        # Configurable AI dot margins (read orientation from toggle_state at runtime)
+        self._ai_dot_margin_x_px = int(dcfg.get("ai_dot_margin_x_px", 20))
+        self._ai_dot_margin_y_px = int(dcfg.get("ai_dot_margin_y_px", 20))
+
         # Weather background (file path optional)
         self._weather_bg_path = dcfg.get("weather_background_image") or dcfg.get("screensaver_image")
 
@@ -722,14 +726,18 @@ class DisplayService:
                     # Margins scale with aspect ratio and orientation
                     w, h = image.size
                     short = min(w, h)
-                    # Base margin is a small percentage of the shorter edge
-                    base_margin = int(short * 0.10)  # ~3%
-                    # Axis-specific margins scale by how each axis compares to the shorter edge
-                    margin_x = max(16, int(base_margin * (w / short)))
-                    margin_y = max(16, int(base_margin * (h / short)))
+                    # Get current orientation from toggle_state.json (if available)
+                    runtime_orientation = self._get_runtime_orientation()
+                    # Apply margin scaling based on orientation
+                    if runtime_orientation == "portrait":
+                        margin_x = int(self._ai_dot_margin_y_px)  # Swap for portrait
+                        margin_y = int(self._ai_dot_margin_x_px)
+                    else:
+                        margin_x = int(self._ai_dot_margin_x_px)
+                        margin_y = int(self._ai_dot_margin_y_px)
 
                     # Radius scales with shorter edge to remain consistent visually
-                    radius = max(10, short // 80)
+                    radius = max(10, short // 50)
 
                     x0 = margin_x
                     y0 = margin_y
@@ -749,6 +757,27 @@ class DisplayService:
     def _make_fallback_background(self) -> Image.Image:
         canvas_w, canvas_h = self._canvas_size()
         return Image.new("RGBA", (canvas_w, canvas_h), color=(0, 0, 0, 255))
+
+    def _get_runtime_orientation(self) -> str:
+        """
+        Read the current orientation from toggle_state.json if it exists.
+        Falls back to self._orientation if file is missing or unreadable.
+        """
+        try:
+            import os
+            import json
+            cfg_dir = self._config.get("config_dir", os.path.dirname(os.path.abspath(__file__)))
+            # Adjust path to find config directory
+            base_dir = os.path.dirname(os.path.dirname(os.path.dirname(cfg_dir)))
+            ts_path = os.path.join(base_dir, "config", "toggle_state.json")
+            if os.path.isfile(ts_path):
+                with open(ts_path, "r") as f:
+                    toggle_state = json.load(f)
+                    o = toggle_state.get("orientation", self._orientation)
+                    return o.lower() if o else self._orientation
+        except Exception:
+            pass
+        return self._orientation
 
     # ---------------------------------------------------------------------
     # Artist backdrop helpers

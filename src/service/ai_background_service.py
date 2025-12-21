@@ -106,6 +106,10 @@ class AIBackgroundService:
 
         # Cached per-refresh context (to avoid duplicate decisions/network calls)
         self._weather_cache: Optional[dict] = None
+        self._weather_cache_timestamp: Optional[datetime.datetime] = None
+        self._weather_cache_ttl_seconds = int(
+            (self._config.get("weather", {}) or {}).get("weather_cache_ttl_seconds", 3600)
+        )  # Default 1 hour
         self._city: Optional[str] = None
         self._weather_desc: Optional[str] = None
         self._astro_text: Optional[str] = None
@@ -347,8 +351,8 @@ class AIBackgroundService:
             except Exception:
                 local_hour = datetime.datetime.now().hour
                 return 7 <= local_hour <= 19
-        # Use cached weather if available
-        if not self._weather_cache:
+        # Fetch fresh weather if cache is missing or stale (important for fallback mode)
+        if not self._is_weather_cache_valid():
             self._fetch_weather_data()
 
         try:
@@ -631,6 +635,26 @@ class AIBackgroundService:
         max_sq = int((self._config.get("image", {}) or {}).get("max_square_size", 1024))
         return f"{max_sq}x{max_sq}"
 
+    def _is_weather_cache_valid(self) -> bool:
+        """
+        Check if cached weather is still fresh (within TTL).
+        Returns True if cache exists and is not stale, False otherwise.
+        """
+        if not self._weather_cache or not self._weather_cache_timestamp:
+            return False
+        age = (datetime.datetime.now() - self._weather_cache_timestamp).total_seconds()
+        is_valid = age < self._weather_cache_ttl_seconds
+        if not is_valid:
+            try:
+                self._logger.debug(
+                    "Weather cache expired: age=%d seconds, TTL=%d seconds",
+                    int(age),
+                    self._weather_cache_ttl_seconds,
+                )
+            except Exception:
+                pass
+        return is_valid
+
     def _fetch_weather_data(self) -> Optional[dict]:
         """
         Fetch weather data once and cache it. Returns a dict with keys:
@@ -653,6 +677,7 @@ class AIBackgroundService:
             desc = (data.get("weather", [{}])[0].get("description") or "").strip().capitalize()
             sys_info = data.get("sys", {}) or {}
             self._weather_cache = {"city": city, "weather_desc": desc or "current local conditions", "sys": sys_info, "raw": data}
+            self._weather_cache_timestamp = datetime.datetime.now()
             # Log fetched weather details for debugging
             try:
                 self._logger.info(
@@ -668,6 +693,7 @@ class AIBackgroundService:
         except Exception as e:
             self._logger.debug(f"OpenWeather fetch failed: {type(e).__name__}: {e}")
             self._weather_cache = None
+            self._weather_cache_timestamp = None
             return None
 
     def _get_model_info(self, model: str) -> dict:

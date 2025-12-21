@@ -123,7 +123,7 @@ display:
   text_offset_bottom_px_landscape: 0
   text_offset_text_shadow_px_landscape: 4
 
-  Portrait - defaults to ikea rodalm mat window
+  # Portrait - defaults to ikea rodalm mat window
   text_offset_left_px_portrait: 5
   text_offset_right_px_portrait: 20
   text_offset_top_px_portrait: 0
@@ -147,7 +147,7 @@ display:
   backdrop_blur_radius: 12
   backdrop_darken_alpha: 120 
   backdrop_use_gradient: false
-  small_album_cover_px: 480
+  small_album_cover_px: 450
 
   # Weather mode background (full-screen fit, orientation-aware, same location at ai generation)
   weather_background_image: "${install_path}/resources/ai_screensaver.png"
@@ -164,6 +164,10 @@ display:
   text_wrap_break_long_words: true   # break very long words if needed
   text_wrap_hyphenate: false         # add a hyphen at wrap if it fitss
   text_line_spacing_px: 4            # extra spacing between wrapped lines
+
+  # AI indicator dot margin (orientation-aware at runtime)
+  ai_dot_margin_x_px: 55            # pixels from left edge
+  ai_dot_margin_y_px: 45            # pixels from top edge
 
 weather:
   openweathermap_api_key: "${openweathermap_api_key}" 
@@ -186,9 +190,9 @@ log:
   log_file_path: "${install_path}/log/now_playing.log"
 
 openai:
-  api_key: $openai_api_key
+  api_key: "${openai_api_key}"
   prompt_style: "80s anime" # e.g., "80s anime", "cyberpunk", "impressionist painting"
-  model: "gpt-image-1" # "dall-e-2/3","gpt-image-1.X"
+  model: "gpt-image-1-mini" # "dall-e-2/3","gpt-image-1.X"
 
 image:
   orientation_strategy: "cover"   # "cover" or "contain"
@@ -209,10 +213,15 @@ lighting:
   night: "Render with low-light exposure: markedly darker scene, high contrast, cooler ambient tones, visible artificial lighting (street lamps, train interiors/headlights, illuminated windows), reduced sky luminance."
 
 audio:
-  recording_duration_seconds: 5 # Total duration to record for music detection/identification (max 10)
+  # Total duration to record for music detection/identification
+  recording_duration_seconds: 5
+  # When true, keep the in-memory buffer AND also write a debug WAV to disk
   debugaudio: false
+  # Optional directory path to write debug WAV files. If omitted, uses ./debug_audio
   debugaudio_path: "${install_path}/debug_audio"
-  gain_db: 0.0
+  # Optional gain (in dB) to apply to recorded audio. 0.0 = no change.
+  # Positive values amplify, negative attenuate.
+  gain_db: 10.0
 
 EOF
 echo "✔ Configuration file created at ${install_path}/config/config.yaml."
