@@ -172,7 +172,8 @@ display:
 weather:
   openweathermap_api_key: "${openweathermap_api_key}" 
   geo_coordinates: "${geo_coordinates}" # format: "latitude,longitude"
-  background_refresh_seconds: 3600 # refresh weather background every N seconds
+  background_refresh_seconds: 3600 # refresh AI background and astro context every N seconds
+  weather_cache_ttl_seconds: 3600   # refresh local weather cache every N seconds
   timezone: "Australia/Melbourne" # for day/night determination
 
 spotify:
@@ -225,6 +226,16 @@ audio:
 
 EOF
 echo "✔ Configuration file created at ${install_path}/config/config.yaml."
+
+echo "==> Creating toggle_state.json with defaults..."
+cat <<EOF > "${install_path}/config/toggle_state.json"
+{
+  "ai_bg_fallback_mode": false,
+  "orientation": "portrait",
+  "rotation": false
+}
+EOF
+echo "✔ Toggle state created at ${install_path}/config/toggle_state.json."
 
 echo "==> Setting up the now-playing systemd service..."
 if [ -f "/etc/systemd/system/now-playing.service" ]; then

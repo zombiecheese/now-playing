@@ -12,6 +12,11 @@ class Logger(metaclass=SingletonMeta):
 
         # Overall logging level (suppress DEBUG by default)
         self._logger.setLevel(logging.INFO)
+        self._logger.propagate = False
+
+        # Avoid adding duplicate handlers if logger is reused
+        if self._logger.handlers:
+            return
 
         # Stream handler for console logging
         stdout_handler = logging.StreamHandler(sys.stdout)

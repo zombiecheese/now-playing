@@ -749,6 +749,8 @@ class AIBackgroundService:
         self._weather_desc = desc
 
         # astro text and lighting text (these functions will use cached weather)
+        # Reset astro cache per refresh so azimuth/phase reflect current time
+        self._astro_text = None
         try:
             self._astro_text = self._sun_moon_context()
         except Exception:

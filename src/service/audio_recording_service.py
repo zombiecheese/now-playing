@@ -48,7 +48,7 @@ class AudioRecordingService:
             raise ValueError("Duration must be positive.")
 
         try:
-            self._logger.info(f"Recording for {duration} seconds at {self._sampling_rate} Hz.")
+            self._logger.debug(f"Recording for {duration} seconds at {self._sampling_rate} Hz.")
             audio = sd.rec(int(duration * self._sampling_rate), dtype=np.float32)
             sd.wait()
             audio = np.squeeze(audio)
