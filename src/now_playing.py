@@ -145,6 +145,28 @@ class NowPlaying:
             )
         ):
             self._set_playing_state_and_update_display(song_info)
+        elif not song_info:
+            # Music is present but no match; show weather/screensaver immediately instead of staying blank
+            try:
+                fallback_path = None
+                show_dot = self._ai_bg_fallback_mode
+                if self._ai_bg_fallback_mode:
+                    try:
+                        fallback_path = self._ai_bg.get_fallback_path()
+                    except Exception as e:
+                        self._logger.warning(f"Failed to get AI fallback path: {e}")
+                        fallback_path = None
+
+                # Avoid re-rendering every loop once we're already in screensaver
+                if self._state_manager.get_state().current != DisplayState.SCREENSAVER:
+                    weather_info = self._weather_service.get_weather_info()
+                    self._set_screensaver_state_and_update_display(
+                        weather_info,
+                        show_ai_dot=show_dot,
+                        fallback_image_path=fallback_path,
+                    )
+            except Exception as e:
+                self._logger.warning(f"Screensaver fallback after identify miss failed: {e}")
         self._state_manager.update_last_music_detected_time()
 
     def _trigger_song_identify(self, audio: np.ndarray) -> SongInfo:

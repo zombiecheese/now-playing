@@ -98,9 +98,13 @@ class DisplayService:
         # Fonts (cached)
         self._font_title: ImageFont.FreeTypeFont
         self._font_subtitle: ImageFont.FreeTypeFont
+        # CJK fallback fonts: store all TTC variants {language: (title_font, subtitle_font)}
+        self._font_fallback_variants: dict[str, Tuple[ImageFont.FreeTypeFont, ImageFont.FreeTypeFont]] = {}
         fpath = dcfg.get("font_path")
+        fpath_fallback = dcfg.get("font_fallback_path")
         fsize_title = int(dcfg.get("font_size_title", 48))
         fsize_subtitle = int(dcfg.get("font_size_subtitle", 32))
+        
         try:
             if not fpath:
                 raise ValueError("Font path missing in config.display.font_path")
@@ -111,6 +115,30 @@ class DisplayService:
             self._logger.warning(f"Falling back to default font: {e}")
             self._font_title = ImageFont.load_default()
             self._font_subtitle = ImageFont.load_default()
+
+        # Optional CJK-capable fallback font (load all TTC variants for dynamic selection)
+        if fpath_fallback:
+            # TTC indices: 0=Japanese, 1=Korean, 2=Simplified Chinese, 3=Traditional Chinese
+            ttc_variants = [("ja", 0), ("ko", 1), ("zh-Hans", 2), ("zh-Hant", 3)]
+            loaded_count = 0
+            for lang_code, index in ttc_variants:
+                try:
+                    title_font = ImageFont.truetype(fpath_fallback, fsize_title, index=index)
+                    subtitle_font = ImageFont.truetype(fpath_fallback, fsize_subtitle, index=index)
+                    self._font_fallback_variants[lang_code] = (title_font, subtitle_font)
+                    loaded_count += 1
+                except Exception as e:
+                    self._logger.debug(f"Could not load TTC index {index} for {lang_code}: {e}")
+            
+            if loaded_count > 0:
+                self._logger.info(f"CJK fallback fonts loaded: {loaded_count} variants from {fpath_fallback}")
+            else:
+                self._logger.warning(f"No CJK fallback fonts could be loaded from: {fpath_fallback}")
+        else:
+            self._logger.warning("No fallback font path configured (config.display.font_fallback_path)")
+
+        # Font metrics cache: {font_id: {"height": int, "ascent": int, "descent": int}}
+        self._font_metrics_cache: dict[int, dict[str, int]] = {}
 
         # Optional Spotify client credentials (for artist image lookup)
         scfg = self._config.get("spotify", {})
@@ -183,11 +211,21 @@ class DisplayService:
         Render 'playing' screen: backdrop (artist or blurred album), album cover,
         title (song), subtitle (artist), and meta (album + year).
         """
-        # Album art with guard + fallback
-        album_cover_image: Image.Image = (
-            self._fetch_image(getattr(song_info, "album_art", None)) or
-            self._make_fallback_background().convert("RGBA")
-        )
+        # Album art with guard + fallback to artist image, then black background
+        album_cover_image: Optional[Image.Image] = self._fetch_image(getattr(song_info, "album_art", None))
+        
+        # If no album art, try to get artist image as fallback
+        artist_image_for_cover = None
+        if not album_cover_image:
+            artist_image_for_cover = self._get_artist_backdrop_image(song_info)
+            if artist_image_for_cover:
+                album_cover_image = artist_image_for_cover
+                self._logger.info("Using artist image as album art fallback")
+        
+        # Final fallback to black background
+        if not album_cover_image:
+            album_cover_image = self._make_fallback_background().convert("RGBA")
+            self._logger.info("No album art or artist image found, using black background")
 
         # Build meta line (album (year) | album | year)
         album_meta = ""
@@ -198,7 +236,8 @@ class DisplayService:
                 album_meta = (song_info.album or "") or (song_info.release_year or "")
 
         # Try artist image as backdrop; fall back to album blurred/darkened
-        artist_backdrop_img = self._get_artist_backdrop_image(song_info)
+        # (Don't use the same artist image as backdrop if we already used it as cover)
+        artist_backdrop_img = None if artist_image_for_cover else self._get_artist_backdrop_image(song_info)
         display_image = self._generate_display_image(
             base_image=album_cover_image,
             title=song_info.title or "",
@@ -216,9 +255,7 @@ class DisplayService:
         """
         Render screensaver/weather screen.
         """
-    # Background image (file) with fallback
-
-        # If a specific fallback path override was provided (e.g., time-relevant AI fallback), prefer it
+        # Background image (file) with fallback
         chosen_path = fallback_image_path or self._weather_bg_path
         if chosen_path:
             try:
@@ -231,21 +268,24 @@ class DisplayService:
         else:
             bg_image = self._make_fallback_background().convert("RGBA")
 
-
-    # Safe text extraction
-        temp        = self._safe_text(getattr(weather_info, "temperature", None))
+        # Safe text extraction with sane defaults so we never raise on startup
+        temp = self._safe_text(getattr(weather_info, "temperature", None))
         raw_sub = self._safe_text(getattr(weather_info, "sub_description", None))
         parts = [p.strip() for p in raw_sub.split(".") if p.strip()]
-        if parts and parts[0].lower().startswith("feels like"):
-            parsed_feels = parts[0]                     # e.g., "Feels like 13�C"
-            parsed_desc  = ". ".join(parts[1:])         # e.g., "Overcast Clouds"
-        if parsed_desc:
-            parsed_desc += "."
 
-    # Decide what goes on each line
-        title    = temp         # Top line
-        subtitle = parsed_desc # Second line
-        meta     = parsed_feels   # Third line
+        parsed_feels = ""
+        parsed_desc = raw_sub
+        if parts and parts[0].lower().startswith("feels like"):
+            parsed_feels = parts[0]              # e.g., "Feels like 13 C"
+            parsed_desc = ". ".join(parts[1:])  # e.g., "Overcast Clouds"
+
+        if parsed_desc:
+            parsed_desc = parsed_desc.rstrip(".") + "."
+
+        # Decide what goes on each line
+        title = temp
+        subtitle = parsed_desc
+        meta = parsed_feels
 
         display_image = self._generate_display_image(
             base_image=bg_image,
@@ -530,9 +570,52 @@ class DisplayService:
             centering=(0.5, 0.5),
         )
 
-    # ---------------------------------------------------------------------
+    def _get_font_metrics(self, font: ImageFont.FreeTypeFont) -> dict[str, int]:
+        """
+        Get actual rendered metrics for a font.
+        Returns: {"height": int, "ascent": int, "descent": int, "line_height": int}
+        Uses cache to avoid repeated calculations.
+        """
+        font_id = id(font)
+        if font_id in self._font_metrics_cache:
+            return self._font_metrics_cache[font_id]
+        
+        # Measure sample text to get bounding box
+        try:
+            # Use diverse characters to get representative metrics
+            sample_text = "Tgj123日本語"
+            bbox = font.getbbox(sample_text)
+            # bbox: (left, top, right, bottom)
+            height = bbox[3] - bbox[1]
+            ascent = max(0, -bbox[1])  # Distance from baseline to top
+            descent = max(0, bbox[3])  # Distance from baseline to bottom
+        except Exception:
+            # Fallback: use font size as estimate
+            height = int(font.size) if hasattr(font, "size") else 16
+            ascent = int(height * 0.8)
+            descent = int(height * 0.2)
+        
+        metrics = {
+            "height": height,
+            "ascent": ascent,
+            "descent": descent,
+            "line_height": height,
+        }
+        self._font_metrics_cache[font_id] = metrics
+        return metrics
+
+    def _is_cjk_font(self, font: ImageFont.FreeTypeFont) -> bool:
+        """
+        Check if a font is one of our CJK variants.
+        """
+        for lang_fonts in self._font_fallback_variants.values():
+            if font in lang_fonts:
+                return True
+        return False
+
+    # -------------------------------------------------------------------------
     # Text rendering
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
 
     def _get_alignment(self) -> str:
         return self._text_alignment_portrait if self._orientation == "portrait" else self._text_alignment_landscape
@@ -548,40 +631,63 @@ class DisplayService:
     ) -> None:
         alignment = self._get_alignment()
 
+        # Get appropriate fonts based on text content
+        meta_font, meta_fallback, meta_lang = self._select_font_for_text(meta, is_title=False)
+        subtitle_font, subtitle_fallback, subtitle_lang = self._select_font_for_text(subtitle, is_title=False)
+        title_font, title_fallback, title_lang = self._select_font_for_text(title, is_title=True)
+
+        # Get metrics for proper sizing
+        meta_metrics = self._get_font_metrics(meta_fallback or meta_font)
+        subtitle_metrics = self._get_font_metrics(subtitle_fallback or subtitle_font)
+        title_metrics = self._get_font_metrics(title_fallback or title_font)
+
+        # Auto-adjust line spacing based on CJK detection
+        # CJK fonts benefit from slightly more spacing
+        base_line_spacing = self._line_spacing_px
+        meta_line_spacing = base_line_spacing + (2 if meta_lang != "en" else 0)
+        subtitle_line_spacing = base_line_spacing + (2 if subtitle_lang != "en" else 0)
+        title_line_spacing = base_line_spacing + (2 if title_lang != "en" else 0)
+
         # Optional meta line (draws first; appears lowest on screen after stacking)
-        meta_position_y = canvas_h - (self._get_text_offset_bottom_px() + self._font_subtitle.size)
+        meta_position_y = canvas_h - (self._get_text_offset_bottom_px() + meta_metrics["height"])
         meta_block_h = 0
         if meta:
             meta_block_h = self._draw_text(
                 image=image,
                 text=meta,
                 text_color="white",
-                font=self._font_subtitle,
+                font=meta_font,
+                fallback_font=meta_fallback,
                 draw_position_y=meta_position_y,
                 canvas_w=canvas_w,
                 alignment=alignment,
+                font_metrics=meta_metrics,
+                line_spacing=meta_line_spacing,
             )
 
         # Subtitle (e.g., artist or Temp � Feels like)
         subtitle_position_y = (
             canvas_h
-            - (self._get_text_offset_bottom_px() + self._font_subtitle.size)
+            - (self._get_text_offset_bottom_px() + subtitle_metrics["height"])
             - meta_block_h
         )
         subtitle_block_h = self._draw_text(
             image=image,
             text=subtitle,
             text_color="white",
-            font=self._font_subtitle,
+            font=subtitle_font,
+            fallback_font=subtitle_fallback,
             draw_position_y=subtitle_position_y,
             canvas_w=canvas_w,
             alignment=alignment,
+            font_metrics=subtitle_metrics,
+            line_spacing=subtitle_line_spacing,
         )
 
         # Title (e.g., song title or weather description)
         title_position_y = (
             canvas_h
-            - (self._get_text_offset_bottom_px() + self._font_title.size)
+            - (self._get_text_offset_bottom_px() + title_metrics["height"])
             - meta_block_h
             - subtitle_block_h
         )
@@ -589,10 +695,13 @@ class DisplayService:
             image=image,
             text=title,
             text_color="white",
-            font=self._font_title,
+            font=title_font,
+            fallback_font=title_fallback,
             draw_position_y=title_position_y,
             canvas_w=canvas_w,
             alignment=alignment,
+            font_metrics=title_metrics,
+            line_spacing=title_line_spacing,
         )
 
     def _draw_text(
@@ -601,9 +710,12 @@ class DisplayService:
         text: str,
         text_color: str,
         font: ImageFont.FreeTypeFont,
+        fallback_font: Optional[ImageFont.FreeTypeFont],
         draw_position_y: int,
         canvas_w: int,
         alignment: str,
+        font_metrics: Optional[dict[str, int]] = None,
+        line_spacing: Optional[int] = None,
     ) -> int:
         # Available width considers left/right offsets and shadow shift
         available_width = (
@@ -616,20 +728,27 @@ class DisplayService:
             text=text,
             max_width=available_width,
             font=font,
+            fallback_font=fallback_font,
             break_long_words=self._wrap_break_long_words,
             hyphenate=self._wrap_hyphenate,
         )
 
+        # Use provided metrics or calculate
+        if font_metrics is None:
+            font_metrics = self._get_font_metrics(fallback_font or font)
+        if line_spacing is None:
+            line_spacing = self._line_spacing_px
+
         draw = ImageDraw.Draw(image)
-        font_size = font.size if hasattr(font, "size") else 16  # default fallback
+        font_height = font_metrics["height"]
 
         # If multiple lines, shift the starting Y upward so the block remains anchored bottom
         if len(lines) > 1:
-            draw_position_y -= (len(lines) - 1) * (font_size + self._line_spacing_px)
+            draw_position_y -= (len(lines) - 1) * (font_height + line_spacing)
 
         total_height = 0
         for line in lines:
-            line_w = int(draw.textlength(line, font=font))
+            line_w = self._text_width(line, font, fallback_font, draw)
             if alignment == "center":
                 x = self._get_text_offset_left_px() + max(0, (available_width - line_w) // 2)
             elif alignment == "right":
@@ -639,19 +758,30 @@ class DisplayService:
 
             # Optional soft shadow (down-right)
             if self._get_text_shadow_px() > 0:
-                draw.text(
-                    (x + self._get_text_shadow_px(), draw_position_y + self._get_text_shadow_px()),
-                    line,
+                self._draw_line_with_fallback(
+                    draw=draw,
+                    line=line,
+                    x_start=x + self._get_text_shadow_px(),
+                    y=draw_position_y + self._get_text_shadow_px(),
                     font=font,
+                    fallback_font=fallback_font,
                     fill="black",
                 )
 
-            draw.text((x, draw_position_y), line, font=font, fill=text_color)
-            draw_position_y += font_size + self._line_spacing_px
-            total_height += font_size + self._line_spacing_px
+            self._draw_line_with_fallback(
+                draw=draw,
+                line=line,
+                x_start=x,
+                y=draw_position_y,
+                font=font,
+                fallback_font=fallback_font,
+                fill=text_color,
+            )
+            draw_position_y += font_height + line_spacing
+            total_height += font_height + line_spacing
 
         if total_height > 0:
-            total_height -= self._line_spacing_px
+            total_height -= line_spacing
         return total_height
 
     @staticmethod
@@ -659,6 +789,7 @@ class DisplayService:
         text: str,
         max_width: int,
         font: ImageFont.FreeTypeFont,
+        fallback_font: Optional[ImageFont.FreeTypeFont],
         break_long_words: bool = True,
         hyphenate: bool = False,
     ) -> list[str]:
@@ -671,7 +802,14 @@ class DisplayService:
         current: list[str] = []
 
         def width_of(tokens: list[str]) -> int:
-            return int(draw.textlength(" ".join(tokens), font=font))
+            return int(
+                DisplayService._text_width(
+                    " ".join(tokens),
+                    font=font,
+                    fallback_font=fallback_font,
+                    draw=draw,
+                )
+            )
 
         for word in words:
             candidate = current + [word]
@@ -680,20 +818,36 @@ class DisplayService:
                 continue
 
             # Long word breaking when a single word exceeds max width
-            if break_long_words and int(draw.textlength(word, font=font)) > max_width:
+            if break_long_words and int(
+                DisplayService._text_width(word, font=font, fallback_font=fallback_font, draw=draw)
+            ) > max_width:
                 if current:
                     lines.append(" ".join(current))
                     current = []
                 segment = ""
                 for ch in word:
                     next_seg = segment + ch
-                    if int(draw.textlength(next_seg, font=font)) <= max_width:
+                    if int(
+                        DisplayService._text_width(
+                            next_seg,
+                            font=font,
+                            fallback_font=fallback_font,
+                            draw=draw,
+                        )
+                    ) <= max_width:
                         segment = next_seg
                     else:
                         # Optionally hyphenate
                         if hyphenate and segment:
                             hyphenated = segment + "-"
-                            if int(draw.textlength(hyphenated, font=font)) <= max_width:
+                            if int(
+                                DisplayService._text_width(
+                                    hyphenated,
+                                    font=font,
+                                    fallback_font=fallback_font,
+                                    draw=draw,
+                                )
+                            ) <= max_width:
                                 lines.append(hyphenated)
                             else:
                                 lines.append(segment)
@@ -710,6 +864,164 @@ class DisplayService:
         if current:
             lines.append(" ".join(current))
         return lines
+
+    @staticmethod
+    def _draw_line_with_fallback(
+        draw: ImageDraw.ImageDraw,
+        line: str,
+        x_start: int,
+        y: int,
+        font: ImageFont.FreeTypeFont,
+        fallback_font: Optional[ImageFont.FreeTypeFont],
+        fill: str,
+    ) -> None:
+        cursor_x = x_start
+        for ch in line:
+            use_font = DisplayService._select_font_for_char(ch, font, fallback_font)
+            draw.text((cursor_x, y), ch, font=use_font, fill=fill)
+            cursor_x += int(draw.textlength(ch, font=use_font))
+
+    @staticmethod
+    def _text_width(
+        text: str,
+        font: ImageFont.FreeTypeFont,
+        fallback_font: Optional[ImageFont.FreeTypeFont],
+        draw: Optional[ImageDraw.ImageDraw] = None,
+    ) -> int:
+        if draw is None:
+            dummy_w = max(1, int(font.size) if hasattr(font, "size") else 100)
+            draw = ImageDraw.Draw(Image.new("RGB", (dummy_w, 1)))
+
+        width = 0
+        for ch in text:
+            use_font = DisplayService._select_font_for_char(ch, font, fallback_font)
+            width += int(draw.textlength(ch, font=use_font))
+        return width
+
+    def _select_font_for_text(
+        self, text: str, is_title: bool
+    ) -> Tuple[ImageFont.FreeTypeFont, Optional[ImageFont.FreeTypeFont], str]:
+        """
+        Select appropriate fonts (main, fallback) based on text content.
+        Detects CJK language and returns the appropriate font variant.
+        Returns: (main_font, fallback_font or None, detected_language)
+        """
+        main_font = self._font_title if is_title else self._font_subtitle
+        
+        # Check if text contains CJK characters
+        has_cjk = any(self._is_cjk(ch) for ch in text)
+        if not has_cjk or not self._font_fallback_variants:
+            return (main_font, None, "en")
+        
+        # Detect language and get appropriate fallback font
+        lang = self._detect_cjk_language(text)
+        if lang in self._font_fallback_variants:
+            fallback_font = self._font_fallback_variants[lang][0 if is_title else 1]
+            return (main_font, fallback_font, lang)
+        
+        # Fallback to Japanese if detected language not available
+        if "ja" in self._font_fallback_variants:
+            fallback_font = self._font_fallback_variants["ja"][0 if is_title else 1]
+            return (main_font, fallback_font, "ja")
+        
+        return (main_font, None, "en")
+
+    @staticmethod
+    def _select_font_for_char(
+        ch: str, font: ImageFont.FreeTypeFont, fallback_font: Optional[ImageFont.FreeTypeFont]
+    ) -> ImageFont.FreeTypeFont:
+        """Select appropriate font for a character, using fallback for CJK."""
+        if fallback_font and DisplayService._is_cjk(ch):
+            return fallback_font
+        return font
+
+    @staticmethod
+    def _is_cjk(ch: str) -> bool:
+        """
+        Check if a character is a CJK (Chinese/Japanese/Korean) character
+        that may require a fallback font.
+        """
+        if not ch:
+            return False
+        code = ord(ch)
+        return (
+            # Japanese
+            0x3040 <= code <= 0x309F   # Hiragana
+            or 0x30A0 <= code <= 0x30FF   # Katakana
+            or 0x31F0 <= code <= 0x31FF   # Katakana Phonetic Extensions
+            # Chinese/Japanese/Korean Ideographs
+            or 0x4E00 <= code <= 0x9FFF   # CJK Unified Ideographs
+            or 0x3400 <= code <= 0x4DBF   # CJK Unified Ideographs Extension A
+            or 0x20000 <= code <= 0x2A6DF # CJK Unified Ideographs Extension B
+            or 0x2A700 <= code <= 0x2B73F # CJK Unified Ideographs Extension C
+            or 0x2B740 <= code <= 0x2B81F # CJK Unified Ideographs Extension D
+            or 0x2B820 <= code <= 0x2CEAF # CJK Unified Ideographs Extension E
+            or 0x2CEB0 <= code <= 0x2EBEF # CJK Unified Ideographs Extension F
+            or 0xF900 <= code <= 0xFAFF   # CJK Compatibility Ideographs
+            or 0x2F800 <= code <= 0x2FA1F # CJK Compatibility Ideographs Supplement
+            # Chinese Phonetic
+            or 0x3100 <= code <= 0x312F   # Bopomofo
+            or 0x31A0 <= code <= 0x31BF   # Bopomofo Extended
+            # Korean
+            or 0xAC00 <= code <= 0xD7AF   # Hangul Syllables
+            or 0x1100 <= code <= 0x11FF   # Hangul Jamo
+            or 0x3130 <= code <= 0x318F   # Hangul Compatibility Jamo
+            or 0xA960 <= code <= 0xA97F   # Hangul Jamo Extended-A
+            or 0xD7B0 <= code <= 0xD7FF   # Hangul Jamo Extended-B
+            # CJK Symbols and Punctuation
+            or 0x3000 <= code <= 0x303F   # CJK Symbols and Punctuation
+            # Full-width forms
+            or 0xFF00 <= code <= 0xFFEF   # Halfwidth and Fullwidth Forms
+        )
+
+    @staticmethod
+    def _detect_cjk_language(text: str) -> str:
+        """
+        Detect which CJK language is predominant in the text.
+        Returns: 'ja' (Japanese), 'ko' (Korean), 'zh-Hans' (Simplified Chinese),
+                 'zh-Hant' (Traditional Chinese), or 'ja' as default.
+        """
+        if not text:
+            return "ja"
+        
+        # Count language-specific characters
+        hiragana_count = 0
+        katakana_count = 0
+        hangul_count = 0
+        bopomofo_count = 0
+        
+        for ch in text:
+            code = ord(ch)
+            if 0x3040 <= code <= 0x309F:  # Hiragana
+                hiragana_count += 1
+            elif 0x30A0 <= code <= 0x30FF or 0x31F0 <= code <= 0x31FF:  # Katakana
+                katakana_count += 1
+            elif 0xAC00 <= code <= 0xD7AF or 0x1100 <= code <= 0x11FF or 0x3130 <= code <= 0x318F:  # Hangul
+                hangul_count += 1
+            elif 0x3100 <= code <= 0x312F or 0x31A0 <= code <= 0x31BF:  # Bopomofo (Traditional Chinese phonetic)
+                bopomofo_count += 1
+        
+        # Korean: has Hangul
+        if hangul_count > 0:
+            return "ko"
+        
+        # Japanese: has Hiragana or Katakana
+        if hiragana_count > 0 or katakana_count > 0:
+            return "ja"
+        
+        # Traditional Chinese: has Bopomofo
+        if bopomofo_count > 0:
+            return "zh-Hant"
+        
+        # For pure Kanji/Hanzi without language-specific markers:
+        # Default to Simplified Chinese if no indicators, but this is a guess
+        # In practice, Japanese is most common in music contexts
+        cjk_count = sum(1 for ch in text if DisplayService._is_cjk(ch))
+        if cjk_count > 0:
+            # Default to Japanese as it's most common in music/media
+            return "ja"
+        
+        return "ja"
 
     # ---------------------------------------------------------------------
     # Display output

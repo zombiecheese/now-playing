@@ -74,6 +74,9 @@ read -r spotify_playlist_id
 echo "Enter your OpenAI api key:"
 read -r openai_api_key
 
+echo "Optional: enter a path to a CJK-capable fallback font (e.g., Noto Sans CJK). Leave blank to skip:"
+read -r font_fallback_path
+
 echo "==> Setting up the configuration in config.yaml..."
 echo "Select your Inky Impression display size:"
 echo "1) 4.0 inch"
@@ -113,6 +116,7 @@ display:
 
   # Fonts & layout
   font_path: "${install_path}/resources/CircularStd-Bold.otf"
+  font_fallback_path: "${install_path}/resources/NotoSansCJK-Regular.ttc"
   font_size_title: 45
   font_size_subtitle: 30
 
