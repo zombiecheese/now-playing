@@ -113,7 +113,11 @@ class AIBackgroundService:
         self._city: Optional[str] = None
         self._weather_desc: Optional[str] = None
         self._astro_text: Optional[str] = None
+        self._astro_text_timestamp: Optional[datetime.datetime] = None
+        self._astro_text_ttl_seconds = 60  # Refresh every 1 minute to keep time-of-day accurate
         self._lighting_text: Optional[str] = None
+        self._lighting_text_timestamp: Optional[datetime.datetime] = None
+        self._lighting_text_ttl_seconds = 60  # Refresh every 1 minute to keep time-of-day accurate
         self._image_size: Optional[str] = None
         self._model_info: Optional[dict] = None
 
@@ -221,9 +225,11 @@ class AIBackgroundService:
         Daytime -> sun azimuth/elevation; Night -> moon phase (as percentage).
         Fallbacks gracefully if astral isn't available or coords invalid.
         """
-        # Use cached results when available
-        if self._astro_text:
-            return self._astro_text
+        # Use cached results only if still fresh (within TTL)
+        if self._astro_text and self._astro_text_timestamp:
+            age = (datetime.datetime.now() - self._astro_text_timestamp).total_seconds()
+            if age < self._astro_text_ttl_seconds:
+                return self._astro_text
 
         if not self._coords_ok:
             local_time = self._get_local_time_str()
@@ -263,14 +269,19 @@ class AIBackgroundService:
                     ph_days = float(moon_phase(now_utc))
                     ph_pct = max(0.0, min(100.0, (ph_days / 29.53) * 100.0))
                     self._astro_text = f"Include the moon with its current phase (~{ph_pct:.0f}%)."
+                self._astro_text_timestamp = datetime.datetime.now()
                 return self._astro_text
             except Exception as e:
                 self._logger.debug(f"Astral calculation failed: {type(e).__name__}: {e}")
                 local_time = self._get_local_time_str()
-                return f"Include the current sun/moon position in the sky appropriate for ({local_time})."
+                self._astro_text = f"Include the current sun/moon position in the sky appropriate for ({local_time})."
+                self._astro_text_timestamp = datetime.datetime.now()
+                return self._astro_text
         else:
             local_time = self._get_local_time_str()
-            return f"Include the current sun/moon position in the sky appropriate for ({local_time})."
+            self._astro_text = f"Include the current sun/moon position in the sky appropriate for ({local_time})."
+            self._astro_text_timestamp = datetime.datetime.now()
+            return self._astro_text
 
     def _get_local_time_str(self) -> str:
         """
@@ -440,38 +451,55 @@ class AIBackgroundService:
             return ""
 
     def _lighting_instructions(self) -> str:
-        # If prepared context already set lighting text, return it to avoid recomputation
-        if self._lighting_text:
-            return self._lighting_text
+        # If prepared context already set lighting text and still fresh, return it to avoid recomputation
+        if self._lighting_text and self._lighting_text_timestamp:
+            age = (datetime.datetime.now() - self._lighting_text_timestamp).total_seconds()
+            if age < self._lighting_text_ttl_seconds:
+                return self._lighting_text
 
         # Prefer lighting strings provided in config under the `lighting` key.
         astro = (self._sun_moon_context() or "").lower()
         # Detect twilight keywords first
         is_twilight = any(k in astro for k in ("civil twilight", "dusk", "dawn", "twilight"))
         if is_twilight:
-            return self._lighting_cfg.get("twilight") or (
+            result = self._lighting_cfg.get("twilight") or (
                 "Use twilight lighting: soft low-angle light, gentle shadows, a sky gradient, moderate contrast, and selective artificial lights beginning to appear."
             )
+            self._lighting_text = result
+            self._lighting_text_timestamp = datetime.datetime.now()
+            return result
 
         # Use daytime detection for day/night; fall back to astro text if needed
         try:
             if self._is_daytime():
-                return self._lighting_cfg.get("day") or (
+                result = self._lighting_cfg.get("day") or (
                     "Use daytime lighting: natural brightness, appropriate color temperature for the time, balanced contrast, and realistic shadows."
                 )
+                self._lighting_text = result
+                self._lighting_text_timestamp = datetime.datetime.now()
+                return result
             else:
-                return self._lighting_cfg.get("night") or (
+                result = self._lighting_cfg.get("night") or (
                     "Render with low-light exposure: markedly darker scene, high contrast, cooler ambient tones, visible artificial lighting (street lamps, train interiors/headlights, illuminated windows), reduced sky luminance."
                 )
+                self._lighting_text = result
+                self._lighting_text_timestamp = datetime.datetime.now()
+                return result
         except Exception:
             # If day/night check fails, fall back to analyzing astro text
             if "night" in astro:
-                return self._lighting_cfg.get("night") or (
+                result = self._lighting_cfg.get("night") or (
                     "Render with low-light exposure: markedly darker scene, high contrast, cooler ambient tones, visible artificial lighting (street lamps, train interiors/headlights, illuminated windows),reduced sky luminance."
                 )
-            return self._lighting_cfg.get("day") or (
+                self._lighting_text = result
+                self._lighting_text_timestamp = datetime.datetime.now()
+                return result
+            result = self._lighting_cfg.get("day") or (
                 "Use daytime lighting: natural brightness, appropriate color temperature for the time, balanced contrast, and realistic shadows."
             )
+            self._lighting_text = result
+            self._lighting_text_timestamp = datetime.datetime.now()
+            return result
 
     def _choose_image_size(self) -> str:
         """
@@ -678,6 +706,11 @@ class AIBackgroundService:
             sys_info = data.get("sys", {}) or {}
             self._weather_cache = {"city": city, "weather_desc": desc or "current local conditions", "sys": sys_info, "raw": data}
             self._weather_cache_timestamp = datetime.datetime.now()
+            # Invalidate astro and lighting caches when weather is refreshed (so time/conditions update)
+            self._astro_text = None
+            self._astro_text_timestamp = None
+            self._lighting_text = None
+            self._lighting_text_timestamp = None
             # Log fetched weather details for debugging
             try:
                 self._logger.info(
@@ -692,8 +725,13 @@ class AIBackgroundService:
             return self._weather_cache
         except Exception as e:
             self._logger.debug(f"OpenWeather fetch failed: {type(e).__name__}: {e}")
+            # Clear caches on fetch failure to avoid stale data
             self._weather_cache = None
             self._weather_cache_timestamp = None
+            self._astro_text = None
+            self._astro_text_timestamp = None
+            self._lighting_text = None
+            self._lighting_text_timestamp = None
             return None
 
     def _get_model_info(self, model: str) -> dict:
