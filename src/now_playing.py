@@ -101,6 +101,7 @@ class NowPlaying:
         except Exception:
             pass
         self._toggle_state_version = self._get_toggle_state_version()
+        self._config_version: Optional[str] = self._get_config_version()
 
         # Initial housekeeping
         self._bg_refresh_queue: queue.Queue[str] = queue.Queue(maxsize=1)
@@ -109,6 +110,7 @@ class NowPlaying:
         self._setup_buttons()
         self._start_button_listener()
         self._start_toggle_state_watcher()
+        self._start_config_watcher()
         self._bootstrap_preview_frame_if_missing()
 
     def _start_background_refresh_worker(self) -> None:
@@ -162,6 +164,7 @@ class NowPlaying:
             try:
                 # Always pick up external toggle-state changes promptly
                 self._refresh_toggle_state_if_changed()
+                self._refresh_config_if_changed()
                 if not self._music_detection_enabled:
                     self._handle_no_music_detected()
                     time.sleep(max(1, int(self._audio_recording_duration)))
@@ -374,6 +377,24 @@ class NowPlaying:
 
         threading.Thread(target=watch, daemon=True).start()
 
+    def _start_config_watcher(self) -> None:
+        def watch():
+            last = self._config_version
+            while True:
+                time.sleep(0.5)
+                try:
+                    current = self._get_config_version()
+                    if current is not None and current != last:
+                        self._logger.info("Config change detected; applying display updates")
+                        self._apply_runtime_config_updates()
+                        last = current
+                        self._config_version = current
+                        self._redraw_current_display()
+                except Exception as e:
+                    self._logger.warning(f"Config watcher error: {e}")
+
+        threading.Thread(target=watch, daemon=True).start()
+
     def _handle_button_a(self) -> None:
         """Toggle music detection/lookup pipeline on or off."""
         try:
@@ -553,6 +574,12 @@ class NowPlaying:
         except Exception:
             return None
 
+    def _get_config_version(self) -> Optional[str]:
+        try:
+            return self._settings_store.config_version()
+        except Exception:
+            return None
+
     def _refresh_toggle_state_if_changed(self) -> None:
         """Reload toggle state if it changed since last load/save."""
         try:
@@ -563,6 +590,44 @@ class NowPlaying:
                 self._toggle_state_version = current_version
         except Exception as e:
             self._logger.warning(f"Toggle state refresh error: {e}")
+
+    def _refresh_config_if_changed(self) -> None:
+        try:
+            current_version = self._get_config_version()
+            if current_version is not None and current_version != self._config_version:
+                self._logger.info("Config changed; reloading display settings")
+                self._apply_runtime_config_updates()
+                self._config_version = current_version
+        except Exception as e:
+            self._logger.warning(f"Config refresh error: {e}")
+
+    def _apply_runtime_config_updates(self) -> None:
+        try:
+            self._config = Config().get_config()
+            self._display_service.reload_display_settings()
+
+            cfg_audio = self._config.get("audio", {}) if isinstance(self._config.get("audio", {}), dict) else {}
+            try:
+                updated_duration = int(
+                    cfg_audio.get(
+                        "recording_duration_seconds",
+                        NowPlaying.DEFAULT_AUDIO_RECORDING_DURATION_IN_SECONDS,
+                    )
+                )
+            except (ValueError, TypeError):
+                updated_duration = NowPlaying.DEFAULT_AUDIO_RECORDING_DURATION_IN_SECONDS
+
+            if 0 < updated_duration <= 30 and updated_duration != self._audio_recording_duration:
+                self._logger.info(
+                    "Applied updated audio recording duration: %s -> %s",
+                    self._audio_recording_duration,
+                    updated_duration,
+                )
+                self._audio_recording_duration = updated_duration
+
+            self._logger.info("Applied runtime display settings update from config store")
+        except Exception as e:
+            self._logger.warning(f"Failed applying runtime config updates: {e}")
 
     def _decode_rotation_value(self, raw_value: object, orientation: str, default_degrees: int) -> int:
         if isinstance(raw_value, bool):

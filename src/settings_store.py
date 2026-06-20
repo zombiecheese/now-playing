@@ -253,6 +253,12 @@ class SettingsStore(metaclass=SingletonMeta):
             return None
         return str(row["updated_at"])
 
+    def config_version(self) -> Optional[str]:
+        row = self._read_document_row("config")
+        if row is None:
+            return None
+        return str(row["updated_at"])
+
     def backup_database(
         self,
         min_interval_seconds: int = DEFAULT_BACKUP_MIN_INTERVAL_SECONDS,

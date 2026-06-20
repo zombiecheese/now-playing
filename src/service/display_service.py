@@ -29,6 +29,7 @@ class DisplayService:
         # Config / logging
         self._config: dict = Config().get_config()
         self._logger: logging.Logger = Logger().get_logger()
+        self._project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
         # Inky hardware
         self._inky = auto()
@@ -99,45 +100,131 @@ class DisplayService:
         self._font_subtitle: ImageFont.FreeTypeFont
         # CJK fallback fonts: store all TTC variants {language: (title_font, subtitle_font)}
         self._font_fallback_variants: dict[str, Tuple[ImageFont.FreeTypeFont, ImageFont.FreeTypeFont]] = {}
-        fpath = dcfg.get("font_path")
-        fpath_fallback = dcfg.get("font_fallback_path")
-        fsize_title = int(dcfg.get("font_size_title", 48))
-        fsize_subtitle = int(dcfg.get("font_size_subtitle", 32))
-        
+        self._load_fonts_from_display_config(dcfg)
+
+        # Font metrics cache: {font_id: {"height": int, "ascent": int, "descent": int}}
+        self._font_metrics_cache: dict[int, dict[str, int]] = {}
+
+    def _resolve_project_relative_path(self, configured_path: Optional[str]) -> Optional[str]:
+        path = (configured_path or "").strip()
+        if not path:
+            return None
+        if os.path.isabs(path):
+            return path
+        return os.path.abspath(os.path.join(self._project_root, path))
+
+    @staticmethod
+    def _safe_int(value: object, default_value: int, minimum: int = 1) -> int:
         try:
-            if not fpath:
+            parsed = int(value)
+        except Exception:
+            return default_value
+        return max(minimum, parsed)
+
+    def _load_fonts_from_display_config(self, dcfg: dict) -> None:
+        configured_font_path = dcfg.get("font_path")
+        configured_fallback_path = dcfg.get("font_fallback_path")
+        fsize_title = self._safe_int(dcfg.get("font_size_title", 48), 48)
+        fsize_subtitle = self._safe_int(dcfg.get("font_size_subtitle", 32), 32)
+
+        resolved_font_path = self._resolve_project_relative_path(configured_font_path)
+        resolved_fallback_path = self._resolve_project_relative_path(configured_fallback_path)
+
+        try:
+            if not resolved_font_path:
                 raise ValueError("Font path missing in config.display.font_path")
-            self._font_title = ImageFont.truetype(fpath, fsize_title)
-            self._font_subtitle = ImageFont.truetype(fpath, fsize_subtitle)
+            self._font_title = ImageFont.truetype(resolved_font_path, fsize_title)
+            self._font_subtitle = ImageFont.truetype(resolved_font_path, fsize_subtitle)
+            self._logger.info(
+                "Loaded display fonts: path=%s title_size=%s subtitle_size=%s",
+                resolved_font_path,
+                fsize_title,
+                fsize_subtitle,
+            )
         except Exception as e:
             # Fallback to default bitmap font if truetype fails
-            self._logger.warning(f"Falling back to default font: {e}")
+            self._logger.warning(
+                "Falling back to default font: %s (configured font_path=%s)",
+                e,
+                configured_font_path,
+            )
             self._font_title = ImageFont.load_default()
             self._font_subtitle = ImageFont.load_default()
 
-        # Optional CJK-capable fallback font (load all TTC variants for dynamic selection)
-        if fpath_fallback:
+        self._font_fallback_variants = {}
+        if resolved_fallback_path:
             # TTC indices: 0=Japanese, 1=Korean, 2=Simplified Chinese, 3=Traditional Chinese
             ttc_variants = [("ja", 0), ("ko", 1), ("zh-Hans", 2), ("zh-Hant", 3)]
             loaded_count = 0
             for lang_code, index in ttc_variants:
                 try:
-                    title_font = ImageFont.truetype(fpath_fallback, fsize_title, index=index)
-                    subtitle_font = ImageFont.truetype(fpath_fallback, fsize_subtitle, index=index)
+                    title_font = ImageFont.truetype(resolved_fallback_path, fsize_title, index=index)
+                    subtitle_font = ImageFont.truetype(resolved_fallback_path, fsize_subtitle, index=index)
                     self._font_fallback_variants[lang_code] = (title_font, subtitle_font)
                     loaded_count += 1
                 except Exception as e:
                     self._logger.debug(f"Could not load TTC index {index} for {lang_code}: {e}")
-            
+
             if loaded_count > 0:
-                self._logger.info(f"CJK fallback fonts loaded: {loaded_count} variants from {fpath_fallback}")
+                self._logger.info(
+                    "CJK fallback fonts loaded: %s variants from %s",
+                    loaded_count,
+                    resolved_fallback_path,
+                )
             else:
-                self._logger.warning(f"No CJK fallback fonts could be loaded from: {fpath_fallback}")
+                self._logger.warning(
+                    "No CJK fallback fonts could be loaded from: %s",
+                    resolved_fallback_path,
+                )
         else:
             self._logger.warning("No fallback font path configured (config.display.font_fallback_path)")
 
-        # Font metrics cache: {font_id: {"height": int, "ascent": int, "descent": int}}
-        self._font_metrics_cache: dict[int, dict[str, int]] = {}
+        # Font objects changed; invalidate metrics cache so subsequent layout uses updated sizes.
+        self._font_metrics_cache = {}
+
+    def reload_display_settings(self) -> None:
+        from config import Config
+
+        self._config = Config().get_config()
+        dcfg = self._config.get("display", {}) if isinstance(self._config.get("display", {}), dict) else {}
+
+        self._weather_bg_path = dcfg.get("weather_background_image") or dcfg.get("screensaver_image")
+        self._text_alignment_portrait = (dcfg.get("text_alignment_portrait") or "left").lower()
+        self._text_alignment_landscape = (dcfg.get("text_alignment_landscape") or "left").lower()
+        self._wrap_break_long_words = bool(dcfg.get("text_wrap_break_long_words", True))
+        self._wrap_hyphenate = bool(dcfg.get("text_wrap_hyphenate", False))
+        self._line_spacing_px = int(dcfg.get("text_line_spacing_px", 0))
+        self._backdrop_blur_radius = int(dcfg.get("backdrop_blur_radius", 12))
+        self._backdrop_darken_alpha = int(dcfg.get("backdrop_darken_alpha", 120))
+        self._backdrop_use_gradient = bool(dcfg.get("backdrop_use_gradient", False))
+        self._album_cover_px = int(dcfg.get("small_album_cover_px", 250))
+
+        self._text_offset_left_px_portrait = int(dcfg.get("text_offset_left_px_portrait", 0))
+        self._text_offset_right_px_portrait = int(dcfg.get("text_offset_right_px_portrait", 0))
+        self._text_offset_top_px_portrait = int(dcfg.get("text_offset_top_px_portrait", 0))
+        self._text_offset_bottom_px_portrait = int(dcfg.get("text_offset_bottom_px_portrait", 0))
+        self._text_offset_text_shadow_px_portrait = int(dcfg.get("text_offset_text_shadow_px_portrait", 0))
+
+        self._text_offset_left_px_landscape = int(dcfg.get("text_offset_left_px_landscape", 0))
+        self._text_offset_right_px_landscape = int(dcfg.get("text_offset_right_px_landscape", 0))
+        self._text_offset_top_px_landscape = int(dcfg.get("text_offset_top_px_landscape", 0))
+        self._text_offset_bottom_px_landscape = int(dcfg.get("text_offset_bottom_px_landscape", 0))
+        self._text_offset_text_shadow_px_landscape = int(dcfg.get("text_offset_text_shadow_px_landscape", 0))
+
+        self._album_offset_left_px_portrait = int(dcfg.get("album_offset_left_px_portrait", 0))
+        self._album_offset_top_px_portrait = int(dcfg.get("album_offset_top_px_portrait", 0))
+        self._album_offset_right_px_portrait = int(dcfg.get("album_offset_right_px_portrait", 0))
+        self._album_offset_bottom_px_portrait = int(dcfg.get("album_offset_bottom_px_portrait", 0))
+
+        self._album_offset_left_px_landscape = int(dcfg.get("album_offset_left_px_landscape", 0))
+        self._album_offset_top_px_landscape = int(dcfg.get("album_offset_top_px_landscape", 0))
+        self._album_offset_right_px_landscape = int(dcfg.get("album_offset_right_px_landscape", 0))
+        self._album_offset_bottom_px_landscape = int(dcfg.get("album_offset_bottom_px_landscape", 0))
+
+        self._ai_dot_margin_x_px = int(dcfg.get("ai_dot_margin_x_px", 20))
+        self._ai_dot_margin_y_px = int(dcfg.get("ai_dot_margin_y_px", 20))
+
+        self._load_fonts_from_display_config(dcfg)
 
     # ---------------------------------------------------------------------
     # Public API

@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import time
+import uuid
 from collections import deque
 from datetime import datetime
 from http import HTTPStatus
@@ -18,7 +19,7 @@ from urllib.parse import parse_qs, urlsplit
 from PIL import Image
 import requests
 
-from settings_store import SettingsStore
+from settings_store import DEFAULT_CONFIG, SettingsStore
 from service.ai_background_service import AIBackgroundService
 
 
@@ -28,8 +29,53 @@ MASKED_SECRET_VALUE = "********"
 FALLBACK_UPLOAD_DIR = PROJECT_ROOT / "config" / "fallback_uploads"
 TEST_AI_PREVIEW_PATH = PROJECT_ROOT / "config" / "test_ai_preview.png"
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+ALLOWED_PATH_SEGMENT_PATTERN = re.compile(r"^[A-Za-z0-9._ -]+$")
 DEFAULT_LOG_FILE_PATH = (PROJECT_ROOT / "log" / "now_playing.log").resolve()
 DEFAULT_DEBUG_AUDIO_PATH = (PROJECT_ROOT / "debug_audio").resolve()
+
+
+def _default_config_value(path: tuple[str, ...], fallback: Any) -> Any:
+  current: Any = DEFAULT_CONFIG
+  for segment in path:
+    if not isinstance(current, dict) or segment not in current:
+      return fallback
+    current = current[segment]
+  return fallback if current is None else current
+
+
+DEFAULT_LOG_FILE_PATH_RELATIVE = str(_default_config_value(("log", "log_file_path"), "log/now_playing.log"))
+DEFAULT_FONT_PATH = str(_default_config_value(("display", "font_path"), "resources/CircularStd-Bold.otf"))
+DEFAULT_FONT_FALLBACK_PATH = str(_default_config_value(("display", "font_fallback_path"), "resources/NotoSansCJK-Regular.ttc"))
+DEFAULT_TEXT_ALIGNMENT_PORTRAIT = str(_default_config_value(("display", "text_alignment_portrait"), "center"))
+DEFAULT_TEXT_ALIGNMENT_LANDSCAPE = str(_default_config_value(("display", "text_alignment_landscape"), "left"))
+DEFAULT_PORTRAIT_ALBUM_BACKGROUND_COLOR = str(_default_config_value(("display", "portrait_album_background_color"), "black"))
+DEFAULT_WEATHER_TIMEZONE = str(_default_config_value(("weather", "timezone"), "Australia/Melbourne"))
+DEFAULT_WEATHER_BACKGROUND_IMAGE = str(_default_config_value(("display", "weather_background_image"), "resources/ai_screensaver.png"))
+DEFAULT_OPENAI_MODEL = str(_default_config_value(("openai", "model"), "gpt-image-1-mini"))
+DEFAULT_OPENAI_PROMPT_STYLE = str(_default_config_value(("openai", "prompt_style"), "80s anime"))
+DEFAULT_LIGHTING_DAY = str(
+  _default_config_value(
+    ("lighting", "day"),
+    "Use daytime lighting: natural brightness, appropriate color temperature, balanced contrast, and realistic shadows.",
+  )
+)
+DEFAULT_LIGHTING_TWILIGHT = str(
+  _default_config_value(
+    ("lighting", "twilight"),
+    "Use twilight lighting: soft low-angle light, gentle shadows, a sky gradient, moderate contrast, and selective artificial lights beginning to appear.",
+  )
+)
+DEFAULT_LIGHTING_NIGHT = str(
+  _default_config_value(
+    ("lighting", "night"),
+    "Render with low-light exposure: markedly darker scene, high contrast, cooler ambient tones, visible artificial lighting (street lamps, train interiors/headlights, illuminated windows), reduced sky luminance.",
+  )
+)
+ALLOWED_FILE_SERVE_ROOTS = (
+  (PROJECT_ROOT / "config").resolve(),
+  (PROJECT_ROOT / "resources").resolve(),
+  (PROJECT_ROOT / "debug_audio").resolve(),
+)
 FALLBACK_TARGET_TO_CONFIG_KEY = {
   "fallback_day_portrait": "fallback_image_path_day_portrait",
   "fallback_night_portrait": "fallback_image_path_night_portrait",
@@ -81,20 +127,17 @@ def _save_uploaded_fallback_image(target: str, filename: str, content_base64: st
     raise ValueError("Uploaded file is not a valid image") from exc
 
   FALLBACK_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-  stem = _sanitize_upload_stem(filename, default="fallback")
   ext = _resolve_upload_extension(filename)
   timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-  save_name = f"{target}_{timestamp}_{stem}{ext}"
+  unique = uuid.uuid4().hex[:10]
+  save_name = f"{target}_{timestamp}_{unique}{ext}"
   save_path = FALLBACK_UPLOAD_DIR / save_name
   save_path.write_bytes(raw)
   return save_path.relative_to(PROJECT_ROOT).as_posix()
 
 
 def _resolve_project_relative_path(configured_path: str) -> Path:
-  path_value = Path(str(configured_path))
-  if path_value.is_absolute():
-    return path_value
-  return (PROJECT_ROOT / path_value).resolve()
+  return _resolve_path_within_project(configured_path, PROJECT_ROOT, "path")
 
 
 def _resolve_path_within_project(configured_path: str, default_path: Path, label: str) -> Path:
@@ -102,8 +145,21 @@ def _resolve_path_within_project(configured_path: str, default_path: Path, label
   if not configured:
     return default_path.resolve()
 
-  raw_path = Path(configured).expanduser()
-  resolved = raw_path.resolve() if raw_path.is_absolute() else (PROJECT_ROOT / raw_path).resolve()
+  normalized = configured.replace("\\", "/")
+  if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized) or normalized.startswith("~"):
+    raise ValueError(f"{label} must be a project-relative path")
+
+  segments = [segment for segment in normalized.split("/") if segment and segment != "."]
+  if not segments:
+    return default_path.resolve()
+
+  for segment in segments:
+    if segment == "..":
+      raise ValueError(f"{label} cannot contain parent-directory traversal")
+    if not ALLOWED_PATH_SEGMENT_PATTERN.fullmatch(segment):
+      raise ValueError(f"{label} contains unsupported path characters")
+
+  resolved = PROJECT_ROOT.joinpath(*segments).resolve()
   project_root = PROJECT_ROOT.resolve()
   try:
     resolved.relative_to(project_root)
@@ -124,6 +180,22 @@ def _sanitize_log_file_setting(value: str) -> str:
 def _sanitize_debug_audio_path_setting(value: str) -> str:
   resolved = _resolve_path_within_project(value, DEFAULT_DEBUG_AUDIO_PATH, "debug_audio_path")
   return _normalize_project_relative_path(resolved)
+
+
+def _string_with_default(value: Any, default: str) -> str:
+  text = str(value or "").strip()
+  return text if text else default
+
+
+def _resolve_served_file_path(file_path: Path) -> Path:
+  resolved = file_path.resolve()
+  for root in ALLOWED_FILE_SERVE_ROOTS:
+    try:
+      resolved.relative_to(root)
+      return resolved
+    except ValueError:
+      continue
+  raise PermissionError("File path is outside allowed directories.")
 
 
 def _content_type_for_file(file_path: Path) -> str:
@@ -189,10 +261,10 @@ def _save_current_generated_image_as_fallback(target: str, config: Dict[str, Any
     raise ValueError("Current generated image is not a valid image file.") from exc
 
   FALLBACK_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-  stem = _sanitize_upload_stem(source_path.name, default="generated")
   ext = source_path.suffix.lower() if source_path.suffix.lower() in ALLOWED_IMAGE_EXTENSIONS else ".png"
   timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-  save_name = f"{target}_{timestamp}_{stem}{ext}"
+  unique = uuid.uuid4().hex[:10]
+  save_name = f"{target}_{timestamp}_{unique}{ext}"
   save_path = FALLBACK_UPLOAD_DIR / save_name
   shutil.copyfile(source_path, save_path)
   return save_path.relative_to(PROJECT_ROOT).as_posix()
@@ -497,6 +569,18 @@ HTML_PAGE = """<!doctype html>
     .status.ok { color: var(--ok); }
     .status.err { color: var(--err); }
 
+    .card h2 .status {
+      margin-top: 0;
+      min-height: 0;
+      font-size: 12px;
+      font-weight: 700;
+      color: rgba(255, 255, 255, 0.92);
+      white-space: nowrap;
+    }
+
+    .card h2 .status.ok { color: #d1fae5; }
+    .card h2 .status.err { color: #fecaca; }
+
     .meta {
       font-family: var(--mono);
       font-size: 12px;
@@ -702,6 +786,7 @@ HTML_PAGE = """<!doctype html>
       <h2>
         <span class="title-text">Configuration Options</span>
         <div class="title-buttons">
+          <div id="status" class="status" role="status" aria-live="polite"></div>
           <button id="saveOptionsBtn">Save Options</button>
           <button class="secondary" id="reloadBtn">Reload</button>
         </div>
@@ -771,14 +856,6 @@ HTML_PAGE = """<!doctype html>
               <div class="field field-with-validation"><label>Pixazo API Key (leave blank to keep current)</label><div class="input-with-validation"><input id="pixazoApiKey" type="password" /><div class="validation-indicator" id="pixazoApiKeyValidation"></div></div><div class="validation-actions"><button type="button" class="secondary validation-test-btn" id="testPixazoKeyBtn">Test Pixazo Credentials</button></div></div>
             </div>
             <div class="meta">Pixazo uses its free Flux 1 Schnell endpoint here. The same provider selection is used for real runtime generation and test-image generation.</div>
-          </div>
-          <div class="subsection">
-            <div class="section-title">Weather</div>
-            <div class="grid">
-              <div class="field"><label>Weather Refresh Seconds</label><input id="weatherRefresh" type="number" min="60" /></div>
-              <div class="field"><label>Timezone</label><input id="weatherTimezone" /></div>
-              <div class="field"><label>Weather Background Image</label><input id="weatherBg" /></div>
-            </div>
           </div>
           <div class="subsection">
             <div class="section-title">Lighting Presets</div>
@@ -866,8 +943,11 @@ HTML_PAGE = """<!doctype html>
           </div>
         </div>
 
-        <div class="section-title">Weather & Integrations</div>
+        <div class="section-title">Weather</div>
         <div class="grid">
+          <div class="field"><label>Weather Refresh Seconds</label><input id="weatherRefresh" type="number" min="60" /></div>
+          <div class="field"><label>Timezone</label><input id="weatherTimezone" /></div>
+          <div class="field"><label>Weather Background Image</label><input id="weatherBg" /></div>
           <div class="field field-with-validation"><label>OpenWeather API Key</label><div class="input-with-validation"><input id="weatherApiKey" type="password" /><div class="validation-indicator" id="weatherApiKeyValidation"></div></div><div class="validation-actions"><button type="button" class="secondary validation-test-btn" id="testWeatherKeyBtn">Test OpenWeather Credentials</button></div></div>
           <div class="field"><label>Geo Coordinates</label><input id="geoCoordinates" /></div>
         </div>
@@ -886,8 +966,6 @@ HTML_PAGE = """<!doctype html>
           <button class="secondary" id="restartAppBtn" type="button">Restart App</button>
         </div>
         <div id="appServiceMeta" class="meta">Loading app service status...</div>
-
-        <div id="status" class="status"></div>
       </div>
     </section>
 
@@ -1028,7 +1106,9 @@ HTML_PAGE = """<!doctype html>
     let activateTabFn = null;
     let portalToken = "";
     let eventSource = null;
+    let eventRefreshTimer = null;
     let restartInFlight = false;
+    const EVENT_AUTO_REFRESH_MS = 5000;
 
     try {
       portalToken = window.localStorage.getItem("nowPlayingAdminToken") || "";
@@ -1185,7 +1265,7 @@ HTML_PAGE = """<!doctype html>
         { key: "openai", title: "AI Image Generation" },
         { key: "display", title: "Display & Image" },
         { key: "orientation", title: "Orientation-Specific" },
-        { key: "weather", title: "Weather & Integrations" },
+        { key: "weather", title: "Weather" },
         { key: "processing", title: "Processing & Logs" }
       ];
 
@@ -1253,17 +1333,7 @@ HTML_PAGE = """<!doctype html>
         tabBar.appendChild(button);
       }
 
-      const savedTab = (() => {
-        try {
-          return window.localStorage.getItem("nowPlayingConfigTab") || "general";
-        } catch (error) {
-          void error;
-          return "general";
-        }
-      })();
-      if (tabPanels.has(savedTab)) {
-        activateTab(savedTab);
-      }
+      activateTab("general");
 
       content.dataset.tabsReady = "true";
     }
@@ -1274,16 +1344,16 @@ HTML_PAGE = """<!doctype html>
       fields.webPort.value = data.web_port ?? 8088;
       fields.webAdminToken.value = data.web_admin_token_configured ? MASKED_SECRET_VALUE : "";
       fields.weatherRefresh.value = data.weather_refresh_seconds ?? 3600;
-      fields.weatherTimezone.value = data.weather_timezone || "";
-      fields.weatherBg.value = data.display_weather_background || "";
+      fields.weatherTimezone.value = data.weather_timezone || "Australia/Melbourne";
+      fields.weatherBg.value = data.display_weather_background || "resources/ai_screensaver.png";
       fields.audioDuration.value = data.audio_recording_duration_seconds ?? 5;
       fields.audioGainDb.value = data.audio_gain_db ?? 0;
       fields.debugAudioEnabled.checked = !!data.debug_audio_enabled;
       fields.debugAudioPath.value = data.debug_audio_path || "";
       fields.displayWidth.value = data.display_width ?? 800;
       fields.displayHeight.value = data.display_height ?? 480;
-      fields.fontPath.value = data.font_path || "";
-      fields.fontFallbackPath.value = data.font_fallback_path || "";
+      fields.fontPath.value = data.font_path || "resources/CircularStd-Bold.otf";
+      fields.fontFallbackPath.value = data.font_fallback_path || "resources/NotoSansCJK-Regular.ttc";
       fields.fontSizeTitle.value = data.font_size_title ?? 45;
       fields.fontSizeSubtitle.value = data.font_size_subtitle ?? 30;
       fields.orientationStrategy.value = data.orientation_strategy || "cover";
@@ -1902,18 +1972,31 @@ HTML_PAGE = """<!doctype html>
     }
 
     function renderEvents(data) {
-      const rows = data.events || [];
+      const rows = Array.isArray(data.events) ? data.events : [];
       if (!rows.length) {
         eventLogEl.innerHTML = '<div class="event-row info">No events available yet.</div>';
         return;
       }
-      eventLogEl.innerHTML = rows.map((evt) => {
+      const newestFirstRows = rows.slice().reverse();
+      eventLogEl.innerHTML = newestFirstRows.map((evt) => {
         const cls = evt.kind || "info";
         const ts = evt.timestamp ? '[' + evt.timestamp + '] ' : '';
         const level = evt.level ? '(' + evt.level + ') ' : '';
         const msg = (evt.message || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         return '<div class="event-row ' + cls + '">' + ts + level + msg + '</div>';
       }).join('');
+    }
+
+    function startEventAutoRefresh() {
+      if (eventRefreshTimer) {
+        clearInterval(eventRefreshTimer);
+      }
+
+      eventRefreshTimer = setInterval(() => {
+        loadEvents().catch((error) => {
+          void error;
+        });
+      }, EVENT_AUTO_REFRESH_MS);
     }
 
     async function loadEvents() {
@@ -2310,6 +2393,7 @@ HTML_PAGE = """<!doctype html>
       await loadAppServiceStatus(true);
       await loadCacheStats();
       startEventStream();
+      startEventAutoRefresh();
     })();
   </script>
 </body>
@@ -2559,21 +2643,32 @@ def list_debug_audio_entries(config: Dict[str, Any], limit: int) -> Dict[str, An
 
 
 def resolve_debug_audio_file(config: Dict[str, Any], name: str) -> Path:
-    debug_dir = resolve_debug_audio_path(config).resolve()
-    requested = Path(str(name or "")).name
-    if not requested or requested in (".", ".."):
-        raise ValueError("Missing debug audio file name.")
+  debug_dir = resolve_debug_audio_path(config).resolve()
+  requested = Path(str(name or "")).name
+  if not requested or requested in (".", ".."):
+    raise ValueError("Missing debug audio file name.")
 
-    candidate = (debug_dir / requested).resolve()
-    try:
-        candidate.relative_to(debug_dir)
-    except ValueError as exc:
-        raise PermissionError("Invalid debug audio file path.") from exc
+  if not re.fullmatch(r"[A-Za-z0-9._ -]+", requested):
+    raise ValueError("Unsupported debug audio file name.")
 
-    if candidate.suffix.lower() not in {".wav", ".mp3", ".ogg", ".m4a", ".flac"}:
-        raise ValueError("Unsupported debug audio file type.")
+  allowed_suffixes = {".wav", ".mp3", ".ogg", ".m4a", ".flac"}
+  requested_suffix = Path(requested).suffix.lower()
+  if requested_suffix not in allowed_suffixes:
+    raise ValueError("Unsupported debug audio file type.")
 
-    return candidate
+  if not debug_dir.exists() or not debug_dir.is_dir():
+    raise FileNotFoundError("Debug audio file not found.")
+
+  candidate = None
+  for entry in debug_dir.iterdir():
+    if entry.is_file() and entry.name == requested:
+      candidate = entry
+      break
+
+  if candidate is None:
+    raise FileNotFoundError("Debug audio file not found.")
+
+  return candidate
 
 
 def delete_debug_audio_file(config: Dict[str, Any], name: str) -> Path:
@@ -2719,14 +2814,14 @@ def build_config_options(config: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "web_enabled": bool(web_cfg.get("enabled", True)),
-        "web_host": str(web_cfg.get("host", "0.0.0.0")),
+        "web_host": _string_with_default(web_cfg.get("host"), "0.0.0.0"),
         "web_port": int(web_cfg.get("port", 8088)),
       "web_admin_token_configured": bool(resolve_web_admin_token(config)),
         "openai_api_key_configured": bool(openai_api_key.strip()),
         "display_width": int(display_cfg.get("width", 800)),
         "display_height": int(display_cfg.get("height", 480)),
-        "font_path": str(display_cfg.get("font_path", "")),
-        "font_fallback_path": str(display_cfg.get("font_fallback_path", "")),
+        "font_path": _string_with_default(display_cfg.get("font_path"), DEFAULT_FONT_PATH),
+        "font_fallback_path": _string_with_default(display_cfg.get("font_fallback_path"), DEFAULT_FONT_FALLBACK_PATH),
         "font_size_title": int(display_cfg.get("font_size_title", 45)),
         "font_size_subtitle": int(display_cfg.get("font_size_subtitle", 30)),
         "text_offset_left_px_portrait": int(display_cfg.get("text_offset_left_px_portrait", 5)),
@@ -2751,39 +2846,39 @@ def build_config_options(config: Dict[str, Any]) -> Dict[str, Any]:
         "backdrop_darken_alpha": int(display_cfg.get("backdrop_darken_alpha", 120)),
         "backdrop_use_gradient": bool(display_cfg.get("backdrop_use_gradient", False)),
         "small_album_cover_px": int(display_cfg.get("small_album_cover_px", 450)),
-        "orientation_strategy": str(image_cfg.get("orientation_strategy", "cover")),
+        "orientation_strategy": _string_with_default(image_cfg.get("orientation_strategy"), "cover"),
         "max_square_size": int(image_cfg.get("max_square_size", 1024)),
         "fallback_image_path": str(image_cfg.get("fallback_image_path", "")),
         "weather_refresh_seconds": int(weather_cfg.get("background_refresh_seconds", 3600)),
-        "weather_timezone": str(weather_cfg.get("timezone", "Australia/Melbourne")),
+        "weather_timezone": _string_with_default(weather_cfg.get("timezone"), DEFAULT_WEATHER_TIMEZONE),
         "weather_api_key": "",
         "weather_api_key_configured": bool(str(weather_cfg.get("openweathermap_api_key", "")).strip()),
         "geo_coordinates": str(weather_cfg.get("geo_coordinates", "")),
-        "display_weather_background": str(display_cfg.get("weather_background_image", "")),
+        "display_weather_background": _string_with_default(display_cfg.get("weather_background_image"), DEFAULT_WEATHER_BACKGROUND_IMAGE),
         "audio_recording_duration_seconds": int(audio_cfg.get("recording_duration_seconds", 5)),
         "audio_gain_db": float(audio_cfg.get("gain_db", 0.0)),
         "debug_audio_enabled": bool(audio_cfg.get("debugaudio", False)),
         "debug_audio_path": str(audio_cfg.get("debugaudio_path", "")),
         "openai_enabled": openai_enabled,
         "music_detection_enabled": music_detection_enabled,
-        "openai_model": str(openai_cfg.get("model", "")),
-        "openai_prompt_style": str(openai_cfg.get("prompt_style", "")),
+        "openai_model": _string_with_default(openai_cfg.get("model"), DEFAULT_OPENAI_MODEL),
+        "openai_prompt_style": _string_with_default(openai_cfg.get("prompt_style"), DEFAULT_OPENAI_PROMPT_STYLE),
         "pixazo_api_key": "",
         "pixazo_api_key_configured": bool(str(openai_cfg.get("pixazo_api_key", "")).strip()),
-        "ai_provider": str(openai_cfg.get("provider", "openai")),
-        "pixazo_model": str(openai_cfg.get("pixazo_model", "flux-schnell")),
+        "ai_provider": _string_with_default(openai_cfg.get("provider"), "openai"),
+        "pixazo_model": _string_with_default(openai_cfg.get("pixazo_model"), "flux-schnell"),
         "ai_dot_margin_x_px": int(display_cfg.get("ai_dot_margin_x_px", 55)),
         "ai_dot_margin_y_px": int(display_cfg.get("ai_dot_margin_y_px", 45)),
-        "lighting_day": str(lighting_cfg.get("day", "")),
-        "lighting_twilight": str(lighting_cfg.get("twilight", "")),
-        "lighting_night": str(lighting_cfg.get("night", "")),
+        "lighting_day": _string_with_default(lighting_cfg.get("day"), DEFAULT_LIGHTING_DAY),
+        "lighting_twilight": _string_with_default(lighting_cfg.get("twilight"), DEFAULT_LIGHTING_TWILIGHT),
+        "lighting_night": _string_with_default(lighting_cfg.get("night"), DEFAULT_LIGHTING_NIGHT),
         "selected_orientation": selected_orientation,
-        "text_alignment_portrait": str(display_cfg.get("text_alignment_portrait", "left")),
-        "text_alignment_landscape": str(display_cfg.get("text_alignment_landscape", "left")),
+        "text_alignment_portrait": _string_with_default(display_cfg.get("text_alignment_portrait"), DEFAULT_TEXT_ALIGNMENT_PORTRAIT),
+        "text_alignment_landscape": _string_with_default(display_cfg.get("text_alignment_landscape"), DEFAULT_TEXT_ALIGNMENT_LANDSCAPE),
         "text_wrap_break_long_words": bool(display_cfg.get("text_wrap_break_long_words", True)),
         "text_wrap_hyphenate": bool(display_cfg.get("text_wrap_hyphenate", False)),
         "text_line_spacing_px": int(display_cfg.get("text_line_spacing_px", 4)),
-        "portrait_album_background_color": str(display_cfg.get("portrait_album_background_color", "black")),
+        "portrait_album_background_color": _string_with_default(display_cfg.get("portrait_album_background_color"), DEFAULT_PORTRAIT_ALBUM_BACKGROUND_COLOR),
         "fallback_day_portrait": str(image_cfg.get("fallback_image_path_day_portrait", "")),
         "fallback_night_portrait": str(image_cfg.get("fallback_image_path_night_portrait", "")),
         "fallback_day_landscape": str(image_cfg.get("fallback_image_path_day_landscape", "")),
@@ -2791,7 +2886,7 @@ def build_config_options(config: Dict[str, Any]) -> Dict[str, Any]:
         "debounce_seconds": int(orchestrator_cfg.get("debounce_seconds", 30)),
         "cache_ttl_seconds": int(orchestrator_cfg.get("cache_ttl_seconds", 86400)),
         "cache_size": int(orchestrator_cfg.get("cache_size", 512)),
-        "log_file_path": str(log_cfg.get("log_file_path", "")),
+        "log_file_path": _string_with_default(log_cfg.get("log_file_path"), DEFAULT_LOG_FILE_PATH_RELATIVE),
     }
 
 
@@ -2810,7 +2905,7 @@ def apply_config_options(config: Dict[str, Any], options: Dict[str, Any], persis
   updated = json.loads(json.dumps(config))
 
   _set_nested(updated, ["web_interface", "enabled"], bool(options.get("web_enabled", True)))
-  _set_nested(updated, ["web_interface", "host"], str(options.get("web_host", "0.0.0.0")))
+  _set_nested(updated, ["web_interface", "host"], _string_with_default(options.get("web_host"), "0.0.0.0"))
   _set_nested(updated, ["web_interface", "port"], int(options.get("web_port", 8088)))
   web_admin_token = options.get("web_admin_token")
   if isinstance(web_admin_token, str):
@@ -2819,8 +2914,8 @@ def apply_config_options(config: Dict[str, Any], options: Dict[str, Any], persis
       _set_nested(updated, ["web_interface", "admin_token"], web_admin_token)
   _set_nested(updated, ["display", "width"], int(options.get("display_width", 800)))
   _set_nested(updated, ["display", "height"], int(options.get("display_height", 480)))
-  _set_nested(updated, ["display", "font_path"], str(options.get("font_path", "")))
-  _set_nested(updated, ["display", "font_fallback_path"], str(options.get("font_fallback_path", "")))
+  _set_nested(updated, ["display", "font_path"], _string_with_default(options.get("font_path"), DEFAULT_FONT_PATH))
+  _set_nested(updated, ["display", "font_fallback_path"], _string_with_default(options.get("font_fallback_path"), DEFAULT_FONT_FALLBACK_PATH))
   _set_nested(updated, ["display", "font_size_title"], int(options.get("font_size_title", 45)))
   _set_nested(updated, ["display", "font_size_subtitle"], int(options.get("font_size_subtitle", 30)))
   _set_nested(updated, ["display", "text_offset_left_px_portrait"], int(options.get("text_offset_left_px_portrait", 5)))
@@ -2845,17 +2940,17 @@ def apply_config_options(config: Dict[str, Any], options: Dict[str, Any], persis
   _set_nested(updated, ["display", "backdrop_darken_alpha"], int(options.get("backdrop_darken_alpha", 120)))
   _set_nested(updated, ["display", "backdrop_use_gradient"], bool(options.get("backdrop_use_gradient", False)))
   _set_nested(updated, ["display", "small_album_cover_px"], int(options.get("small_album_cover_px", 450)))
-  _set_nested(updated, ["display", "text_alignment_portrait"], str(options.get("text_alignment_portrait", "left")))
-  _set_nested(updated, ["display", "text_alignment_landscape"], str(options.get("text_alignment_landscape", "left")))
+  _set_nested(updated, ["display", "text_alignment_portrait"], _string_with_default(options.get("text_alignment_portrait"), DEFAULT_TEXT_ALIGNMENT_PORTRAIT))
+  _set_nested(updated, ["display", "text_alignment_landscape"], _string_with_default(options.get("text_alignment_landscape"), DEFAULT_TEXT_ALIGNMENT_LANDSCAPE))
   _set_nested(updated, ["display", "text_wrap_break_long_words"], bool(options.get("text_wrap_break_long_words", True)))
   _set_nested(updated, ["display", "text_wrap_hyphenate"], bool(options.get("text_wrap_hyphenate", False)))
   _set_nested(updated, ["display", "text_line_spacing_px"], int(options.get("text_line_spacing_px", 4)))
   _set_nested(updated, ["display", "ai_dot_margin_x_px"], int(options.get("ai_dot_margin_x_px", 55)))
   _set_nested(updated, ["display", "ai_dot_margin_y_px"], int(options.get("ai_dot_margin_y_px", 45)))
-  _set_nested(updated, ["display", "portrait_album_background_color"], str(options.get("portrait_album_background_color", "black")))
+  _set_nested(updated, ["display", "portrait_album_background_color"], _string_with_default(options.get("portrait_album_background_color"), DEFAULT_PORTRAIT_ALBUM_BACKGROUND_COLOR))
   _set_nested(updated, ["weather", "background_refresh_seconds"], int(options.get("weather_refresh_seconds", 3600)))
-  _set_nested(updated, ["weather", "timezone"], str(options.get("weather_timezone", "Australia/Melbourne")))
-  _set_nested(updated, ["display", "weather_background_image"], str(options.get("display_weather_background", "")))
+  _set_nested(updated, ["weather", "timezone"], _string_with_default(options.get("weather_timezone"), DEFAULT_WEATHER_TIMEZONE))
+  _set_nested(updated, ["display", "weather_background_image"], _string_with_default(options.get("display_weather_background"), DEFAULT_WEATHER_BACKGROUND_IMAGE))
   weather_api_key = options.get("weather_api_key")
   if isinstance(weather_api_key, str):
     weather_api_key = weather_api_key.strip()
@@ -2875,16 +2970,16 @@ def apply_config_options(config: Dict[str, Any], options: Dict[str, Any], persis
   _set_nested(updated, ["image", "fallback_image_path_night_portrait"], str(options.get("fallback_night_portrait", "")))
   _set_nested(updated, ["image", "fallback_image_path_day_landscape"], str(options.get("fallback_day_landscape", "")))
   _set_nested(updated, ["image", "fallback_image_path_night_landscape"], str(options.get("fallback_night_landscape", "")))
-  _set_nested(updated, ["image", "orientation_strategy"], str(options.get("orientation_strategy", "cover")))
+  _set_nested(updated, ["image", "orientation_strategy"], _string_with_default(options.get("orientation_strategy"), "cover"))
   _set_nested(updated, ["image", "max_square_size"], int(options.get("max_square_size", 1024)))
   fallback_image_path = options.get("fallback_image_path")
   if isinstance(fallback_image_path, str):
     _set_nested(updated, ["image", "fallback_image_path"], fallback_image_path.strip())
 
-  _set_nested(updated, ["openai", "model"], str(options.get("openai_model", "")))
-  _set_nested(updated, ["openai", "prompt_style"], str(options.get("openai_prompt_style", "")))
-  _set_nested(updated, ["openai", "provider"], str(options.get("ai_provider", "openai")))
-  _set_nested(updated, ["openai", "pixazo_model"], str(options.get("pixazo_model", "flux-schnell")))
+  _set_nested(updated, ["openai", "model"], _string_with_default(options.get("openai_model"), DEFAULT_OPENAI_MODEL))
+  _set_nested(updated, ["openai", "prompt_style"], _string_with_default(options.get("openai_prompt_style"), DEFAULT_OPENAI_PROMPT_STYLE))
+  _set_nested(updated, ["openai", "provider"], _string_with_default(options.get("ai_provider"), "openai"))
+  _set_nested(updated, ["openai", "pixazo_model"], _string_with_default(options.get("pixazo_model"), "flux-schnell"))
   pixazo_api_key = options.get("pixazo_api_key")
   if isinstance(pixazo_api_key, str):
     pixazo_api_key = pixazo_api_key.strip()
@@ -2908,11 +3003,11 @@ def apply_config_options(config: Dict[str, Any], options: Dict[str, Any], persis
   _set_nested(updated, ["orchestrator", "cache_ttl_seconds"], int(options.get("cache_ttl_seconds", 86400)))
   _set_nested(updated, ["orchestrator", "cache_size"], int(options.get("cache_size", 512)))
   log_file_path = _sanitize_log_file_setting(str(options.get("log_file_path", "")))
-  _set_nested(updated, ["log", "log_file_path"], log_file_path)
+  _set_nested(updated, ["log", "log_file_path"], _string_with_default(log_file_path, DEFAULT_LOG_FILE_PATH_RELATIVE))
 
-  _set_nested(updated, ["lighting", "day"], str(options.get("lighting_day", "")))
-  _set_nested(updated, ["lighting", "twilight"], str(options.get("lighting_twilight", "")))
-  _set_nested(updated, ["lighting", "night"], str(options.get("lighting_night", "")))
+  _set_nested(updated, ["lighting", "day"], _string_with_default(options.get("lighting_day"), DEFAULT_LIGHTING_DAY))
+  _set_nested(updated, ["lighting", "twilight"], _string_with_default(options.get("lighting_twilight"), DEFAULT_LIGHTING_TWILIGHT))
+  _set_nested(updated, ["lighting", "night"], _string_with_default(options.get("lighting_night"), DEFAULT_LIGHTING_NIGHT))
 
   return updated
 
@@ -3032,19 +3127,25 @@ class ConfigManagerHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
   def _send_file(self, file_path: Path) -> None:
-        if not file_path.exists() or not file_path.is_file():
-            self._send_json({"error": f"Image file does not exist: {file_path}"}, HTTPStatus.NOT_FOUND)
-            return
+      try:
+        resolved_path = _resolve_served_file_path(file_path)
+      except PermissionError as exc:
+        self._send_json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
+        return
 
-        mime = _content_type_for_file(file_path)
+      if not resolved_path.exists() or not resolved_path.is_file():
+        self._send_json({"error": f"Image file does not exist: {resolved_path}"}, HTTPStatus.NOT_FOUND)
+        return
 
-        content = file_path.read_bytes()
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", mime)
-        self.send_header("Content-Length", str(len(content)))
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        self.wfile.write(content)
+      mime = _content_type_for_file(resolved_path)
+
+      content = resolved_path.read_bytes()
+      self.send_response(HTTPStatus.OK)
+      self.send_header("Content-Type", mime)
+      self.send_header("Content-Length", str(len(content)))
+      self.send_header("Cache-Control", "no-cache")
+      self.end_headers()
+      self.wfile.write(content)
 
   def _send_image_with_rotation(self, file_path: Path, rotate_degrees: int) -> None:
         if rotate_degrees % 360 == 0:
