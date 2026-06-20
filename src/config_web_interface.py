@@ -278,6 +278,50 @@ HTML_PAGE = """<!doctype html>
     .event-row:last-child { border-bottom: 0; }
     .event-row.failure { background: #fde8e8; color: #7f1d1d; border-left: 4px solid #b91c1c; }
     .event-row.fallback { background: #fff1db; color: #7c2d12; border-left: 4px solid #ea580c; }
+
+    .debug-audio-meta {
+      margin-top: 10px;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: #4a463f;
+    }
+
+    .debug-audio-list {
+      margin-top: 10px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      max-height: 220px;
+      overflow: auto;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    .debug-audio-row {
+      padding: 8px 10px;
+      border-bottom: 1px solid #efe9dc;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .debug-audio-row:last-child { border-bottom: 0; }
+
+    .debug-audio-name {
+      font-weight: 600;
+      word-break: break-all;
+    }
+
+    .debug-audio-details {
+      color: #6b675f;
+      margin-top: 2px;
+    }
+
+    .debug-audio-player {
+      margin-top: 10px;
+      width: 100%;
+    }
     .event-row.info { background: #f8fafc; color: #1f2937; border-left: 4px solid #64748b; }
 
     @media (max-width: 980px) {
@@ -345,6 +389,10 @@ HTML_PAGE = """<!doctype html>
           <div class="grid">
             <div class="field"><label>Debug Audio Path</label><input id="debugAudioPath" /></div>
           </div>
+          <div class="row"><button id="refreshDebugAudioBtn" type="button">Refresh Debug Audio</button></div>
+          <div id="debugAudioMeta" class="debug-audio-meta">Debug audio list unavailable.</div>
+          <div id="debugAudioList" class="debug-audio-list"></div>
+          <audio id="debugAudioPlayer" class="debug-audio-player" controls preload="none"></audio>
         </div>
 
         <div class="section-title">Display & Image</div>
@@ -480,6 +528,9 @@ HTML_PAGE = """<!doctype html>
     const eventLogEl = document.getElementById("eventLog");
     const spotifyAuthStatusEl = document.getElementById("spotifyAuthStatus");
     const cacheStatsEl = document.getElementById("cacheStats");
+    const debugAudioMetaEl = document.getElementById("debugAudioMeta");
+    const debugAudioListEl = document.getElementById("debugAudioList");
+    const debugAudioPlayerEl = document.getElementById("debugAudioPlayer");
 
     const fields = {
       webEnabled: document.getElementById("webEnabled"),
@@ -883,6 +934,7 @@ HTML_PAGE = """<!doctype html>
         "Reload": "Re-reads settings from the database and refreshes the form.",
         "Refresh Image State": "Fetches the latest selected/preview image metadata and updates preview pane.",
         "Refresh Events": "Loads recent service log events.",
+        "Refresh Debug Audio": "Loads recent debug audio recordings from the configured debug audio folder.",
         "Open Spotify Login": "Starts Spotify OAuth in a new tab.",
         "Refresh Spotify Status": "Checks whether a Spotify token exists and is still valid.",
         "Refresh Cache Stats": "Reloads cache/database health statistics.",
@@ -939,6 +991,72 @@ HTML_PAGE = """<!doctype html>
         if (!button.title) {
           button.title = buttonHints[text] || text;
         }
+      }
+    }
+
+    function formatBytes(bytes) {
+      const value = Number(bytes || 0);
+      if (value < 1024) return `${value} B`;
+      if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+      return `${(value / (1024 * 1024)).toFixed(2)} MB`;
+    }
+
+    function escapeHtml(text) {
+      return String(text || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/\"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function buildDebugAudioUrl(fileName) {
+      const params = new URLSearchParams({ name: fileName });
+      if (portalToken) {
+        params.set("token", portalToken);
+      }
+      return '/api/debug-audio/file?' + params.toString();
+    }
+
+    function renderDebugAudioList(data) {
+      const rows = data.files || [];
+      if (!rows.length) {
+        debugAudioListEl.innerHTML = '<div class="event-row info">No debug recordings found.</div>';
+        debugAudioPlayerEl.removeAttribute('src');
+        debugAudioPlayerEl.load();
+        return;
+      }
+
+      debugAudioListEl.innerHTML = rows.map((row) => {
+        const fileName = escapeHtml(row.name);
+        const size = escapeHtml(formatBytes(row.size_bytes));
+        const modified = escapeHtml(row.modified_at || "");
+        return (
+          '<div class="debug-audio-row">' +
+            '<div>' +
+              '<div class="debug-audio-name">' + fileName + '</div>' +
+              '<div class="debug-audio-details">' + size + ' • ' + modified + '</div>' +
+            '</div>' +
+            '<button type="button" class="secondary debug-audio-play-btn" data-name="' + fileName + '">Play</button>' +
+          '</div>'
+        );
+      }).join('');
+    }
+
+    async function loadDebugAudioList() {
+      try {
+        const res = await apiFetch('/api/debug-audio?limit=30');
+        const data = await res.json();
+        if (!res.ok) {
+          debugAudioMetaEl.textContent = data.error || 'Failed to load debug recordings.';
+          debugAudioListEl.innerHTML = '<div class="event-row failure">Debug recordings unavailable.</div>';
+          return;
+        }
+        debugAudioMetaEl.textContent = 'Showing ' + (data.files ? data.files.length : 0) + ' recordings from: ' + (data.directory || '(unknown)');
+        renderDebugAudioList(data);
+      } catch (error) {
+        debugAudioMetaEl.textContent = `Failed to load debug recordings: ${error}`;
+        debugAudioListEl.innerHTML = '<div class="event-row failure">Debug recordings unavailable.</div>';
       }
     }
 
@@ -1258,9 +1376,23 @@ HTML_PAGE = """<!doctype html>
     });
     document.getElementById("refreshImageBtn").addEventListener("click", loadImageState);
     document.getElementById("refreshEventsBtn").addEventListener("click", loadEvents);
+    document.getElementById("refreshDebugAudioBtn").addEventListener("click", loadDebugAudioList);
     document.getElementById("spotifyAuthStartBtn").addEventListener("click", openSpotifyLogin);
     document.getElementById("spotifyAuthStatusBtn").addEventListener("click", loadSpotifyAuthStatus);
     document.getElementById("refreshCacheStatsBtn").addEventListener("click", loadCacheStats);
+
+    debugAudioListEl.addEventListener("click", (evt) => {
+      const target = evt.target;
+      if (!(target instanceof HTMLElement) || !target.classList.contains("debug-audio-play-btn")) {
+        return;
+      }
+      const fileName = target.getAttribute("data-name") || "";
+      if (!fileName) {
+        return;
+      }
+      debugAudioPlayerEl.src = buildDebugAudioUrl(fileName);
+      debugAudioPlayerEl.play().catch(() => {});
+    });
 
     (async () => {
       setupSectionTabs();
@@ -1268,6 +1400,7 @@ HTML_PAGE = """<!doctype html>
       await loadOptions();
       await loadImageState();
       await loadEvents();
+      await loadDebugAudioList();
       await loadSpotifyAuthStatus();
       await loadCacheStats();
       startEventStream();
@@ -1423,6 +1556,64 @@ def resolve_log_file_path(config: Dict[str, Any]) -> Path:
         p = Path(str(configured))
         return p if p.is_absolute() else (PROJECT_ROOT / p).resolve()
     return (PROJECT_ROOT / "log" / "now_playing.log").resolve()
+
+
+def resolve_debug_audio_path(config: Dict[str, Any]) -> Path:
+    audio_cfg = config.get("audio", {}) if isinstance(config.get("audio", {}), dict) else {}
+    configured = str(audio_cfg.get("debugaudio_path", "")).strip()
+    if configured:
+        p = Path(configured)
+        return p if p.is_absolute() else (PROJECT_ROOT / p).resolve()
+    return (PROJECT_ROOT / "debug_audio").resolve()
+
+
+def list_debug_audio_entries(config: Dict[str, Any], limit: int) -> Dict[str, Any]:
+    debug_dir = resolve_debug_audio_path(config)
+    max_items = max(1, min(limit, 200))
+    allowed_suffixes = {".wav", ".mp3", ".ogg", ".m4a", ".flac"}
+
+    if not debug_dir.exists() or not debug_dir.is_dir():
+        return {"directory": str(debug_dir), "files": []}
+
+    files: list[Path] = []
+    for entry in debug_dir.iterdir():
+        if not entry.is_file():
+            continue
+        if entry.suffix.lower() not in allowed_suffixes:
+            continue
+        files.append(entry)
+
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    payload: list[Dict[str, Any]] = []
+    for item in files[:max_items]:
+        stat = item.stat()
+        payload.append(
+            {
+                "name": item.name,
+                "size_bytes": int(stat.st_size),
+                "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+            }
+        )
+
+    return {"directory": str(debug_dir), "files": payload}
+
+
+def resolve_debug_audio_file(config: Dict[str, Any], name: str) -> Path:
+    debug_dir = resolve_debug_audio_path(config).resolve()
+    requested = Path(str(name or "")).name
+    if not requested or requested in (".", ".."):
+        raise ValueError("Missing debug audio file name.")
+
+    candidate = (debug_dir / requested).resolve()
+    try:
+        candidate.relative_to(debug_dir)
+    except ValueError as exc:
+        raise PermissionError("Invalid debug audio file path.") from exc
+
+    if candidate.suffix.lower() not in {".wav", ".mp3", ".ogg", ".m4a", ".flac"}:
+        raise ValueError("Unsupported debug audio file type.")
+
+    return candidate
 
 
 def classify_event_kind(level: str, message: str) -> str:
@@ -1936,6 +2127,31 @@ class ConfigManagerHandler(BaseHTTPRequestHandler):
           self._send_json(payload)
         except ValueError:
           self._send_json({"error": "Invalid 'limit' query value."}, HTTPStatus.BAD_REQUEST)
+        except Exception as exc:
+          self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        return
+
+      if path == "/api/debug-audio":
+        try:
+          config = load_config_data()
+          requested = query.get("limit", ["30"])[0]
+          self._send_json(list_debug_audio_entries(config, int(requested)))
+        except ValueError:
+          self._send_json({"error": "Invalid debug audio request."}, HTTPStatus.BAD_REQUEST)
+        except Exception as exc:
+          self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        return
+
+      if path == "/api/debug-audio/file":
+        try:
+          config = load_config_data()
+          name = str((query.get("name", [""]) or [""])[0]).strip()
+          file_path = resolve_debug_audio_file(config, name)
+          self._send_file(file_path)
+        except ValueError as exc:
+          self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        except PermissionError as exc:
+          self._send_json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
         except Exception as exc:
           self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         return
