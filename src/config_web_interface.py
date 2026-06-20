@@ -2,7 +2,6 @@ import argparse
 import base64
 import binascii
 import json
-import mimetypes
 import re
 import shutil
 import subprocess
@@ -29,6 +28,8 @@ MASKED_SECRET_VALUE = "********"
 FALLBACK_UPLOAD_DIR = PROJECT_ROOT / "config" / "fallback_uploads"
 TEST_AI_PREVIEW_PATH = PROJECT_ROOT / "config" / "test_ai_preview.png"
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+DEFAULT_LOG_FILE_PATH = (PROJECT_ROOT / "log" / "now_playing.log").resolve()
+DEFAULT_DEBUG_AUDIO_PATH = (PROJECT_ROOT / "debug_audio").resolve()
 FALLBACK_TARGET_TO_CONFIG_KEY = {
   "fallback_day_portrait": "fallback_image_path_day_portrait",
   "fallback_night_portrait": "fallback_image_path_night_portrait",
@@ -94,6 +95,62 @@ def _resolve_project_relative_path(configured_path: str) -> Path:
   if path_value.is_absolute():
     return path_value
   return (PROJECT_ROOT / path_value).resolve()
+
+
+def _resolve_path_within_project(configured_path: str, default_path: Path, label: str) -> Path:
+  configured = str(configured_path or "").strip()
+  if not configured:
+    return default_path.resolve()
+
+  raw_path = Path(configured).expanduser()
+  resolved = raw_path.resolve() if raw_path.is_absolute() else (PROJECT_ROOT / raw_path).resolve()
+  project_root = PROJECT_ROOT.resolve()
+  try:
+    resolved.relative_to(project_root)
+  except ValueError as exc:
+    raise ValueError(f"{label} must stay within {project_root}") from exc
+  return resolved
+
+
+def _normalize_project_relative_path(path_value: Path) -> str:
+  return path_value.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
+
+
+def _sanitize_log_file_setting(value: str) -> str:
+  resolved = _resolve_path_within_project(value, DEFAULT_LOG_FILE_PATH, "log_file_path")
+  return _normalize_project_relative_path(resolved)
+
+
+def _sanitize_debug_audio_path_setting(value: str) -> str:
+  resolved = _resolve_path_within_project(value, DEFAULT_DEBUG_AUDIO_PATH, "debug_audio_path")
+  return _normalize_project_relative_path(resolved)
+
+
+def _content_type_for_file(file_path: Path) -> str:
+  suffix = file_path.suffix.lower()
+  if suffix == ".png":
+    return "image/png"
+  if suffix in {".jpg", ".jpeg"}:
+    return "image/jpeg"
+  if suffix == ".webp":
+    return "image/webp"
+  if suffix == ".bmp":
+    return "image/bmp"
+  if suffix == ".gif":
+    return "image/gif"
+  if suffix == ".svg":
+    return "image/svg+xml"
+  if suffix == ".wav":
+    return "audio/wav"
+  if suffix == ".mp3":
+    return "audio/mpeg"
+  if suffix == ".ogg":
+    return "audio/ogg"
+  if suffix == ".m4a":
+    return "audio/mp4"
+  if suffix == ".flac":
+    return "audio/flac"
+  return "application/octet-stream"
 
 
 def _resolve_current_generated_image(config: Dict[str, Any]) -> Path:
@@ -2454,20 +2511,20 @@ def redact_sensitive_text(message: str) -> str:
 
 def resolve_log_file_path(config: Dict[str, Any]) -> Path:
     log_cfg = config.get("log", {}) if isinstance(config.get("log", {}), dict) else {}
-    configured = log_cfg.get("log_file_path")
-    if configured:
-        p = Path(str(configured))
-        return p if p.is_absolute() else (PROJECT_ROOT / p).resolve()
-    return (PROJECT_ROOT / "log" / "now_playing.log").resolve()
+    configured = str(log_cfg.get("log_file_path", "")).strip()
+    try:
+      return _resolve_path_within_project(configured, DEFAULT_LOG_FILE_PATH, "log_file_path")
+    except ValueError:
+      return DEFAULT_LOG_FILE_PATH
 
 
 def resolve_debug_audio_path(config: Dict[str, Any]) -> Path:
     audio_cfg = config.get("audio", {}) if isinstance(config.get("audio", {}), dict) else {}
     configured = str(audio_cfg.get("debugaudio_path", "")).strip()
-    if configured:
-        p = Path(configured)
-        return p if p.is_absolute() else (PROJECT_ROOT / p).resolve()
-    return (PROJECT_ROOT / "debug_audio").resolve()
+    try:
+      return _resolve_path_within_project(configured, DEFAULT_DEBUG_AUDIO_PATH, "debug_audio_path")
+    except ValueError:
+      return DEFAULT_DEBUG_AUDIO_PATH
 
 
 def list_debug_audio_entries(config: Dict[str, Any], limit: int) -> Dict[str, Any]:
@@ -2811,7 +2868,8 @@ def apply_config_options(config: Dict[str, Any], options: Dict[str, Any], persis
   debug_audio_enabled = bool(options.get("debug_audio_enabled", False))
   _set_nested(updated, ["audio", "debugaudio"], debug_audio_enabled)
   if debug_audio_enabled:
-    _set_nested(updated, ["audio", "debugaudio_path"], str(options.get("debug_audio_path", "")))
+    debug_audio_path = _sanitize_debug_audio_path_setting(str(options.get("debug_audio_path", "")))
+    _set_nested(updated, ["audio", "debugaudio_path"], debug_audio_path)
 
   _set_nested(updated, ["image", "fallback_image_path_day_portrait"], str(options.get("fallback_day_portrait", "")))
   _set_nested(updated, ["image", "fallback_image_path_night_portrait"], str(options.get("fallback_night_portrait", "")))
@@ -2849,7 +2907,8 @@ def apply_config_options(config: Dict[str, Any], options: Dict[str, Any], persis
   _set_nested(updated, ["orchestrator", "debounce_seconds"], int(options.get("debounce_seconds", 30)))
   _set_nested(updated, ["orchestrator", "cache_ttl_seconds"], int(options.get("cache_ttl_seconds", 86400)))
   _set_nested(updated, ["orchestrator", "cache_size"], int(options.get("cache_size", 512)))
-  _set_nested(updated, ["log", "log_file_path"], str(options.get("log_file_path", "")))
+  log_file_path = _sanitize_log_file_setting(str(options.get("log_file_path", "")))
+  _set_nested(updated, ["log", "log_file_path"], log_file_path)
 
   _set_nested(updated, ["lighting", "day"], str(options.get("lighting_day", "")))
   _set_nested(updated, ["lighting", "twilight"], str(options.get("lighting_twilight", "")))
@@ -2977,9 +3036,7 @@ class ConfigManagerHandler(BaseHTTPRequestHandler):
             self._send_json({"error": f"Image file does not exist: {file_path}"}, HTTPStatus.NOT_FOUND)
             return
 
-        mime, _ = mimetypes.guess_type(str(file_path))
-        if not mime:
-            mime = "application/octet-stream"
+        mime = _content_type_for_file(file_path)
 
         content = file_path.read_bytes()
         self.send_response(HTTPStatus.OK)
@@ -3389,7 +3446,11 @@ class ConfigManagerHandler(BaseHTTPRequestHandler):
           options = dict(base_options)
           if isinstance(payload, dict):
             options.update(payload)
-          updated = apply_config_options(config, options)
+          try:
+            updated = apply_config_options(config, options)
+          except ValueError as exc:
+            self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
           write_config_data(updated)
           write_selected_orientation(str(options.get("selected_orientation", "portrait")))
           self._send_json({"message": "Config options saved."})

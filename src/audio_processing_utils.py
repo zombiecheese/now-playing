@@ -1,7 +1,7 @@
 import io
 import logging
-import os
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 from scipy.signal import resample
@@ -11,6 +11,22 @@ from config import Config
 
 class AudioProcessingUtils:
     _logger: logging.Logger = Logger().get_logger()
+    _project_root = Path(__file__).resolve().parent.parent
+    _default_debug_dir = (_project_root / 'debug_audio').resolve()
+
+    @staticmethod
+    def _resolve_safe_debug_dir(configured_path: str) -> Path:
+        configured = str(configured_path or '').strip()
+        if not configured:
+            return AudioProcessingUtils._default_debug_dir
+
+        raw = Path(configured).expanduser()
+        resolved = raw.resolve() if raw.is_absolute() else (AudioProcessingUtils._project_root / raw).resolve()
+        try:
+            resolved.relative_to(AudioProcessingUtils._project_root)
+        except ValueError as exc:
+            raise ValueError(f"debugaudio_path must stay within {AudioProcessingUtils._project_root}") from exc
+        return resolved
 
     @staticmethod
     def resample(audio: np.ndarray, source_sampling_rate: int, target_sampling_rate: int) -> np.ndarray:
@@ -35,15 +51,11 @@ class AudioProcessingUtils:
                 debug_enabled = bool(audio_cfg.get('debugaudio', False))
                 if debug_enabled:
                     debug_path = audio_cfg.get('debugaudio_path')
-                    if debug_path:
-                        os.makedirs(debug_path, exist_ok=True)
-                        dir_path = debug_path
-                    else:
-                        dir_path = os.path.join(os.getcwd(), 'debug_audio')
-                        os.makedirs(dir_path, exist_ok=True)
+                    dir_path = AudioProcessingUtils._resolve_safe_debug_dir(str(debug_path or ''))
+                    dir_path.mkdir(parents=True, exist_ok=True)
                     filename = f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
-                    file_path = os.path.join(dir_path, filename)
-                    with open(file_path, 'wb') as f:
+                    file_path = dir_path / filename
+                    with file_path.open('wb') as f:
                         f.write(buffer.getvalue())
                     AudioProcessingUtils._logger.info(f"Wrote debug WAV to {file_path}")
                     buffer.seek(0)
