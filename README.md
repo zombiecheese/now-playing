@@ -136,6 +136,12 @@ Configure one provider in the admin portal:
 
 ### ⚙️ Installation Script
 
+The installer is designed for a Raspberry Pi host and must be run as a regular user (not root).
+It clones this repository into a `now-playing/` directory in your current location.
+
+If an existing `now-playing/` directory is present, the setup script removes it first.
+Back up local edits before running setup.
+
 SSH into your Raspberry Pi:
 
 ```bash
@@ -153,6 +159,9 @@ And run:
 The `setup.sh` script installs and starts both systemd services:
 - `now-playing.service` (main runtime)
 - `now-playing-web.service` (admin portal)
+
+It also injects runtime-specific unit fields (ExecStart, WorkingDirectory, User, Group)
+into the copied service templates so the units are runnable on your host.
 
 Verify both services start without errors:
 
@@ -182,6 +191,17 @@ Should you encounter any errors, check [Known Issues](#-known-issues)
 
 ## 🛠 Useful Commands
 
+## ⚙️ Current Operations Model
+
+The project now runs as two cooperating services:
+
+- `now-playing.service`: main runtime (audio detection, song lookup, display rendering, AI/fallback decisions)
+- `now-playing-web.service`: admin portal (settings UI, preview, events, cache stats, app status/restart controls)
+
+The web service is intentionally separate so the portal can restart or inspect the main app without taking the portal down.
+
+In normal operation, manage both services with systemd and use the web portal for day-to-day settings and runtime controls.
+
 ### 📝 Edit Configuration
 
 To update your configuration after installation:
@@ -194,6 +214,9 @@ You can manage the SQLite-backed settings store from a browser and preview the c
 
 The web manager runs as a dedicated `now-playing-web` systemd service, independent from the main `now-playing` runtime.
 This allows the admin portal to restart the main app service without taking the portal down.
+
+For standard usage, start/enable the service and access the portal in a browser.
+Manual Python launch is only needed for debugging.
 
 Run the manager:
 
@@ -219,6 +242,16 @@ What it supports:
 Notes:
 - The portal persists changes directly to the database; no manual file editing is required
 - The image preview is based on current fallback mode, orientation, and day/night assumptions
+- In **Display & Image**, only fallback controls for the selected orientation are shown
+- **Use Current Generated** is only shown while **Enable AI image generation** is enabled
+- After restarting services, the web API can take a short moment to accept connections; refresh after a few seconds if needed
+
+Recommended portal workflow:
+1. Set runtime toggles in **General** (music detection, AI generation)
+2. Choose orientation context in **Orientation-Specific** before adjusting offsets
+3. Configure fallback images in **Display & Image** for portrait and landscape day/night variants
+4. Use **Use Current Generated** to quickly seed fallback images from the current generated preview (AI enabled only)
+5. Use **App Service** controls to verify health or restart the main runtime
 
 ### 🔄 Update Script
 
@@ -233,7 +266,7 @@ The `update.sh` script makes updating your installation simple and safe:
 - Fetches the latest code from the GitHub repository
 - Resets your installation to the latest version (preserves the SQLite settings database and cache files)
 - Updates Python dependencies to their latest versions
-- Reinstalls unit files and restarts both services
+- Reinstalls unit files, reapplies runtime unit fields (ExecStart/WorkingDirectory/User/Group), and restarts both services
 
 **Important Notes:**
 - Your SQLite settings database is preserved
@@ -282,96 +315,6 @@ To leave the virtual environment:
 
 ```bash
   deactivate
-```
-
-## 🎨 Fine-Tuning Display Layout
-
-The admin portal exposes extensive control over text and image positioning, allowing you to perfectly align elements for your specific display and aesthetic preferences.
-
-### Text Offset Configuration
-
-Text offsets control the margins and shadow effects for song information. Configure separately for each orientation:
-
-**Landscape Mode:**
-```text
-text_offset_left_px_landscape: 0      # Distance from left edge
-text_offset_right_px_landscape: 0     # Distance from right edge
-text_offset_top_px_landscape: 0       # Distance from top
-text_offset_bottom_px_landscape: 0    # Distance from bottom
-text_offset_text_shadow_px_landscape: 4  # Shadow depth for text readability
-```
-
-**Portrait Mode:**
-```text
-text_offset_left_px_portrait: 5       # Distance from left edge
-text_offset_right_px_portrait: 20     # Distance from right edge
-text_offset_top_px_portrait: 0        # Distance from top
-text_offset_bottom_px_portrait: 80    # Distance from bottom
-text_offset_text_shadow_px_portrait: 4   # Shadow depth for text readability
-```
-
-### Album Art Offset Configuration
-
-Album art offsets allow precise positioning of the album cover image:
-
-**Landscape Mode:**
-```text
-album_offset_left_px_landscape: 0     # Move album art left/right
-album_offset_right_px_landscape: 0    # Adjust right-side spacing
-album_offset_top_px_landscape: 0      # Move album art up/down
-album_offset_bottom_px_landscape: 0   # Adjust bottom spacing
-```
-
-**Portrait Mode:**
-```text
-album_offset_left_px_portrait: 0      # Move album art left/right
-album_offset_right_px_portrait: 14    # Adjust right-side spacing
-album_offset_top_px_portrait: 49      # Move album art up/down
-album_offset_bottom_px_portrait: 0    # Adjust bottom spacing
-```
-
-### Tuning Tips
-
-1. **Start Small**: Make incremental changes (5-10px at a time) to avoid overshooting
-2. **Test Both Orientations**: Remember to check both portrait and landscape modes
-3. **Consider Text Length**: Longer song titles may need different offset values
-4. **Shadow Depth**: Increase `text_offset_text_shadow_px` for better readability on busy backgrounds
-5. **Live Testing**: After editing config, restart the service and wait for a song to play:
-   ```bash
-   sudo systemctl restart now-playing.service
-   journalctl -u now-playing.service --follow
-   ```
-
-### Text Alignment Options
-
-In addition to offsets, you can control text alignment:
-
-```text
-text_alignment_portrait: "center"    # Options: "left", "center", "right"
-text_alignment_landscape: "left"     # Options: "left", "center", "right"
-```
-
-### Common Layout Scenarios
-
-**Centered Layout (Portrait):**
-```text
-text_alignment_portrait: "center"
-text_offset_left_px_portrait: 20
-text_offset_right_px_portrait: 20
-text_offset_bottom_px_portrait: 40
-```
-
-**Left-Aligned with Album on Right (Landscape):**
-```text
-text_alignment_landscape: "left"
-text_offset_left_px_landscape: 20
-album_offset_right_px_landscape: 20
-```
-
-**Bottom-Aligned Text (Portrait):**
-```text
-text_offset_bottom_px_portrait: 100   # Push text to bottom
-album_offset_top_px_portrait: 20      # Album at top
 ```
 
 ## 🐛 Known Issues
