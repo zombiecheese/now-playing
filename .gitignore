@@ -1,6 +1,34 @@
-*.log
-.cache
-*.pyc
-__pycache__
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.cache/
+.pytest_cache/
+
+# IDE/local editor state
 .vscode/settings.json
+
+# Runtime outputs
+log/
+*.log
+debug_audio/
+
+# Local runtime/state data
 config/*
+config/now_playing.db
+config/now_playing.db-*
+config/backups/
+config/current_display_preview.png
+config/toggle_state.json
+
+# OS noise
+.DS_Store
+Thumbs.db
