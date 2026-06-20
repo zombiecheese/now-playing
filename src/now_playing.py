@@ -2,7 +2,7 @@
 import logging
 import sys
 import os
-import json
+import queue
 import numpy as np
 import traceback
 import signal
@@ -12,10 +12,12 @@ import gpiod
 import gpiodevice
 from gpiod.line import Bias, Direction, Edge
 import threading
+from config_web_interface import run_server as run_config_web_server
 
 # Local imports
 from logger import Logger
 from config import Config
+from settings_store import SettingsStore
 from state_manager import StateManager, DisplayState
 from service.song_identify_service import SongIdentifyService, SongInfo
 from audio_processing_utils import AudioProcessingUtils  # <-- fixed typo
@@ -84,35 +86,122 @@ class NowPlaying:
         self._spotify_service: SpotifyService = SpotifyService()
         self._state_manager: StateManager = StateManager()
 
+        # Config web interface settings (served alongside the main app by default)
+        web_cfg = self._config.get("web_interface", {})
+        self._web_enabled: bool = bool(web_cfg.get("enabled", True))
+        self._web_host: str = str(web_cfg.get("host", "0.0.0.0"))
+        self._web_port: int = int(web_cfg.get("port", 8088))
+
         # NEW: OpenAI background generator (uses weather.background_refresh_seconds from config)
         self._ai_bg: AIBackgroundService = AIBackgroundService()
+        self._settings_store: SettingsStore = SettingsStore()
         # When True: force using AI background fallback images (no generation)
         self._ai_bg_fallback_mode: bool = False
-        self._toggle_state_mtime: Optional[float] = None
-        # Display orientation (portrait or landscape) defaults; toggle_state overrides
+        self._music_detection_enabled: bool = True
+        self._toggle_state_version: Optional[str] = None
+        # Display orientation (portrait or landscape) defaults; toggle state overrides
         self._orientation: str = "portrait"
         self._portrait_rotate_degrees: int = 90
         self._landscape_rotate_degrees: int = 0
-        # Ensure toggle state file exists with defaults
-        self._ensure_toggle_state_file_exists()
-        # Load persisted toggle state (if present)
+        # Ensure toggle state exists with defaults, then load persisted values
+        self._ensure_toggle_state_exists()
         try:
-            self._load_toggle_state_from_file()
+            self._load_toggle_state_from_store()
         except Exception:
             pass
-        self._toggle_state_mtime = self._get_toggle_state_mtime()
+        self._toggle_state_version = self._get_toggle_state_version()
 
         # Initial housekeeping
+        self._bg_refresh_queue: queue.Queue[str] = queue.Queue(maxsize=1)
+        self._start_background_refresh_worker()
+        self._start_web_interface_if_enabled()
         self._clean_display_and_set_clean_state()
         self._setup_buttons()
         self._start_button_listener()
         self._start_toggle_state_watcher()
+        self._bootstrap_preview_frame_if_missing()
+
+    def _start_background_refresh_worker(self) -> None:
+        def worker() -> None:
+            while True:
+                reason = self._bg_refresh_queue.get()
+                try:
+                    self._logger.debug("Processing queued AI background refresh (%s)", reason)
+                    self._ai_bg.refresh_background_if_needed()
+                except Exception as e:
+                    self._logger.warning(f"Background refresh worker failed ({reason}): {e}")
+                finally:
+                    self._bg_refresh_queue.task_done()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _queue_background_refresh(self, reason: str) -> None:
+        try:
+            self._bg_refresh_queue.put_nowait(reason)
+        except queue.Full:
+            self._logger.debug("Skipped queueing AI background refresh (%s): request already pending", reason)
+
+    def _start_web_interface_if_enabled(self) -> None:
+        if not self._web_enabled:
+            self._logger.info("Config web interface is disabled via config.web_interface.enabled")
+            return
+
+        def serve_web() -> None:
+            try:
+                run_config_web_server(self._web_host, self._web_port)
+            except OSError as e:
+                self._logger.warning(
+                    "Config web interface failed to bind on %s:%s (%s). Continuing without web interface.",
+                    self._web_host,
+                    self._web_port,
+                    e,
+                )
+            except Exception as e:
+                self._logger.warning(f"Config web interface stopped unexpectedly: {e}")
+
+        thread = threading.Thread(target=serve_web, daemon=True)
+        thread.start()
+        self._logger.info(
+            "Config web interface started on http://%s:%s",
+            self._web_host,
+            self._web_port,
+        )
+
+    def _bootstrap_preview_frame_if_missing(self) -> None:
+        web_cfg = self._config.get("web_interface", {}) if isinstance(self._config.get("web_interface", {}), dict) else {}
+        preview_path = web_cfg.get("preview_image_path") or os.path.join(os.path.dirname(__file__), "..", "config", "current_display_preview.png")
+        preview_path = os.path.abspath(preview_path)
+
+        if os.path.exists(preview_path):
+            return
+
+        try:
+            weather_info = self._weather_service.get_weather_info()
+            fallback_path = None
+            show_dot = self._ai_bg_fallback_mode
+            if self._ai_bg_fallback_mode:
+                try:
+                    fallback_path = self._ai_bg.get_fallback_path()
+                except Exception:
+                    fallback_path = None
+            self._set_screensaver_state_and_update_display(
+                weather_info,
+                show_ai_dot=show_dot,
+                fallback_image_path=fallback_path,
+            )
+            self._logger.info("Bootstrapped initial rendered preview frame at %s", preview_path)
+        except Exception as e:
+            self._logger.warning(f"Failed to bootstrap rendered preview frame: {e}")
 
     def run(self) -> None:
         while True:
             try:
-                # Always pick up external changes to toggle_state.json promptly
+                # Always pick up external toggle-state changes promptly
                 self._refresh_toggle_state_if_changed()
+                if not self._music_detection_enabled:
+                    self._handle_no_music_detected()
+                    time.sleep(max(1, int(self._audio_recording_duration)))
+                    continue
                 audio, is_music_detected = self._record_audio_and_detect_music()
                 if is_music_detected:
                     self._handle_music_detected(audio)
@@ -296,23 +385,18 @@ class NowPlaying:
 
     def _start_toggle_state_watcher(self) -> None:
         def watch():
-            last = self._toggle_state_mtime
+            last = self._toggle_state_version
             while True:
                 time.sleep(0.5)
                 try:
-                    current = self._get_toggle_state_mtime()
+                    current = self._get_toggle_state_version()
                     if current is not None and current != last:
                         self._logger.info("Toggle state change detected; applying immediately")
-                        self._load_toggle_state_from_file()
+                        self._load_toggle_state_from_store()
                         last = current
-                        self._toggle_state_mtime = current
+                        self._toggle_state_version = current
                         if not self._ai_bg_fallback_mode:
-                            def worker_refresh():
-                                try:
-                                    self._ai_bg.refresh_background_if_needed()
-                                except Exception as e:
-                                    self._logger.warning(f"Background refresh after external toggle failed: {e}")
-                            threading.Thread(target=worker_refresh, daemon=True).start()
+                            self._queue_background_refresh("toggle_watcher")
                         self._redraw_current_display()
                 except Exception as e:
                     self._logger.warning(f"Toggle state watcher error: {e}")
@@ -320,17 +404,25 @@ class NowPlaying:
         threading.Thread(target=watch, daemon=True).start()
 
     def _handle_button_a(self) -> None:
-        """Add the currently playing track to the configured Spotify playlist."""
+        """Toggle music detection/lookup pipeline on or off."""
         try:
-            if not self._state_manager.get_state().current == DisplayState.PLAYING:
-                return
-            title = self._state_manager.get_playing_state().song_title
-            artist = self._state_manager.get_playing_state().song_artist
-            track_uri = self._spotify_service.search_track_uri(title, artist)
-            if track_uri:
-                self._spotify_service.add_to_playlist(track_uri)
+            prev = bool(self._music_detection_enabled)
+            self._music_detection_enabled = not prev
+            try:
+                self._save_toggle_state_to_store()
+            except Exception as e:
+                self._logger.warning(f"Failed to persist music detection toggle: {e}")
+
+            self._logger.info(
+                "Music detection/lookup changed: %s -> %s",
+                prev,
+                self._music_detection_enabled,
+            )
+
+            if not self._music_detection_enabled:
+                self._handle_no_music_detected()
         except Exception as e:
-            self._logger.error(f"Error occurred: {e}")
+            self._logger.error(f"Error toggling music detection/lookup mode: {e}")
             self._logger.error(traceback.format_exc())
 
     def _handle_button_b(self) -> None:
@@ -343,7 +435,7 @@ class NowPlaying:
             prev = bool(self._ai_bg_fallback_mode)
             self._ai_bg_fallback_mode = not prev
             try:
-                self._save_toggle_state_to_file()
+                self._save_toggle_state_to_store()
             except Exception as e:
                 self._logger.warning(f"Failed to persist toggle state: {e}")
 
@@ -351,13 +443,7 @@ class NowPlaying:
 
             # If generation was re-enabled (toggle turned OFF), attempt an immediate background refresh in worker thread
             if not self._ai_bg_fallback_mode:
-                def worker_refresh():
-                    try:
-                        self._ai_bg.refresh_background_if_needed()
-                    except Exception as e:
-                        self._logger.warning(f"Background refresh after toggle failed: {e}")
-
-                threading.Thread(target=worker_refresh, daemon=True).start()
+                self._queue_background_refresh("button_b_toggle")
 
             # Immediately update screensaver to reflect the new mode (if screensaver active or eligible)
             if (
@@ -420,7 +506,7 @@ class NowPlaying:
             
             # Persist the new orientation and rotation
             try:
-                self._save_toggle_state_to_file()
+                self._save_toggle_state_to_store()
             except Exception as e:
                 self._logger.warning(f"Failed to persist orientation change: {e}")
             
@@ -456,141 +542,114 @@ class NowPlaying:
             self._logger.error(f"Error toggling orientation: {e}")
             self._logger.error(traceback.format_exc())
 
-    def _state_file_path(self) -> str:
-        # Persist toggle state next to the main config YAML
-        base = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'config'))
+    def _ensure_toggle_state_exists(self) -> None:
+        """Create toggle state defaults in the database if the row does not exist yet."""
         try:
-            os.makedirs(base, exist_ok=True)
-        except Exception:
-            pass
-        return os.path.join(base, 'toggle_state.json')
-
-    def _ensure_toggle_state_file_exists(self) -> None:
-        """Create toggle_state.json with default values if it doesn't exist."""
-        path = self._state_file_path()
-        try:
-            if not os.path.exists(path):
-                self._logger.info(f"Creating toggle state file with defaults: {path}")
-                with open(path, 'w', encoding='utf-8') as f:
-                    json.dump(
-                        {
-                            'ai_bg_fallback_mode': True,
-                            'orientation': 'portrait',
-                            'rotation': False,
-                        },
-                        f,
-                        indent=4,
-                    )
+            self._settings_store.load_toggle_state()
         except Exception as e:
-            self._logger.warning(f"Failed to create default toggle state file: {e}")
+            self._logger.warning(f"Failed to initialize default toggle state: {e}")
 
-    def _get_toggle_state_mtime(self) -> Optional[float]:
+    def _get_toggle_state_version(self) -> Optional[str]:
         try:
-            return os.path.getmtime(self._state_file_path())
-        except OSError:
+            return self._settings_store.toggle_state_version()
+        except Exception:
             return None
 
     def _refresh_toggle_state_if_changed(self) -> None:
-        """Reload toggle_state.json if it changed since last load/save."""
+        """Reload toggle state if it changed since last load/save."""
         try:
-            current_mtime = self._get_toggle_state_mtime()
-            if current_mtime is not None and current_mtime != self._toggle_state_mtime:
-                self._logger.info("Toggle state file changed; reloading")
-                self._load_toggle_state_from_file()
-                self._toggle_state_mtime = current_mtime
+            current_version = self._get_toggle_state_version()
+            if current_version is not None and current_version != self._toggle_state_version:
+                self._logger.info("Toggle state changed; reloading")
+                self._load_toggle_state_from_store()
+                self._toggle_state_version = current_version
         except Exception as e:
             self._logger.warning(f"Toggle state refresh error: {e}")
 
-    def _load_toggle_state_from_file(self) -> None:
-        path = self._state_file_path()
+    def _decode_rotation_value(self, raw_value: object, orientation: str, default_degrees: int) -> int:
+        if isinstance(raw_value, bool):
+            return 270 if (raw_value and orientation == "portrait") else (
+                90 if orientation == "portrait" else (180 if raw_value else 0)
+            )
         try:
-            if os.path.exists(path):
-                with open(path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    self._ai_bg_fallback_mode = bool(data.get('ai_bg_fallback_mode', False))
-                    self._orientation = (data.get('orientation') or self._orientation).lower()
+            return int(raw_value)
+        except Exception:
+            return default_degrees
 
-                    # Consolidated rotation structure: a single bool or legacy per-orientation values.
-                    # Booleans: portrait True/False -> 90/270; landscape True/False -> 0/180.
-                    rotation_raw = data.get('rotation')
-
-                    def _decode_rotation_value(raw_value: object, orientation: str, default_degrees: int) -> int:
-                        if isinstance(raw_value, bool):
-                            return 270 if (raw_value and orientation == "portrait") else (
-                                90 if orientation == "portrait" else (180 if raw_value else 0)
-                            )
-                        try:
-                            return int(raw_value)
-                        except Exception:
-                            return default_degrees
-
-                    if isinstance(rotation_raw, bool):
-                        # Single bool drives both orientations
-                        self._portrait_rotate_degrees = _decode_rotation_value(rotation_raw, 'portrait', self._portrait_rotate_degrees)
-                        self._landscape_rotate_degrees = _decode_rotation_value(rotation_raw, 'landscape', self._landscape_rotate_degrees)
-                    else:
-                        portrait_raw = rotation_raw.get('portrait') if isinstance(rotation_raw, dict) else rotation_raw
-                        landscape_raw = rotation_raw.get('landscape') if isinstance(rotation_raw, dict) else rotation_raw
-
-                        self._portrait_rotate_degrees = _decode_rotation_value(
-                            portrait_raw if portrait_raw is not None else data.get('portrait_rotate_degrees'),
-                            'portrait',
-                            self._portrait_rotate_degrees,
-                        )
-                        self._landscape_rotate_degrees = _decode_rotation_value(
-                            landscape_raw if landscape_raw is not None else data.get('landscape_rotate_degrees'),
-                            'landscape',
-                            self._landscape_rotate_degrees,
-                        )
-
-                    self._display_service.set_orientation(
-                        self._orientation,
-                        portrait_rotate_degrees=self._portrait_rotate_degrees,
-                        landscape_rotate_degrees=self._landscape_rotate_degrees,
-                    )
-                    self._logger.info(f"Loaded AI background fallback mode from {path}: {self._ai_bg_fallback_mode}")
-                    self._logger.info(
-                        "Loaded display orientation=%s, portrait_rotate=%s, landscape_rotate=%s",
-                        self._orientation,
-                        self._portrait_rotate_degrees,
-                        self._landscape_rotate_degrees,
-                    )
-        except Exception as e:
-            self._logger.warning(f"Failed to load toggle state from {path}: {e}")
-
-    def _save_toggle_state_to_file(self) -> None:
-        path = self._state_file_path()
+    def _load_toggle_state_from_store(self) -> None:
         try:
-            temp = path + '.tmp'
-            with open(temp, 'w', encoding='utf-8') as f:
-                def _encode_rotation_bool(p_deg: int, l_deg: int) -> bool:
-                    p_bool = True if p_deg == 270 else False if p_deg == 0 else None
-                    l_bool = True if l_deg == 180 else False if l_deg == 0 else None
-                    if p_bool is not None and l_bool is not None and p_bool == l_bool:
-                        return p_bool
-                    if p_bool is not None:
-                        return p_bool
-                    if l_bool is not None:
-                        return l_bool
-                    return True  # fallback
+            data = self._settings_store.load_toggle_state()
+            self._ai_bg_fallback_mode = bool(data.get('ai_bg_fallback_mode', False))
+            self._music_detection_enabled = bool(data.get('music_detection_enabled', True))
+            self._orientation = (data.get('orientation') or self._orientation).lower()
 
-                json.dump(
-                    {
-                        'ai_bg_fallback_mode': bool(self._ai_bg_fallback_mode),
-                        'orientation': self._orientation,
-                        'rotation': _encode_rotation_bool(self._portrait_rotate_degrees, self._landscape_rotate_degrees),
-                    },
-                    f,
+            # Consolidated rotation structure: a single bool or legacy per-orientation values.
+            # Booleans: portrait True/False -> 90/270; landscape True/False -> 0/180.
+            rotation_raw = data.get('rotation')
+
+            if isinstance(rotation_raw, bool):
+                self._portrait_rotate_degrees = self._decode_rotation_value(rotation_raw, 'portrait', self._portrait_rotate_degrees)
+                self._landscape_rotate_degrees = self._decode_rotation_value(rotation_raw, 'landscape', self._landscape_rotate_degrees)
+            else:
+                portrait_raw = rotation_raw.get('portrait') if isinstance(rotation_raw, dict) else rotation_raw
+                landscape_raw = rotation_raw.get('landscape') if isinstance(rotation_raw, dict) else rotation_raw
+
+                self._portrait_rotate_degrees = self._decode_rotation_value(
+                    portrait_raw if portrait_raw is not None else data.get('portrait_rotate_degrees'),
+                    'portrait',
+                    self._portrait_rotate_degrees,
                 )
-            try:
-                os.replace(temp, path)
-            except Exception:
-                # os.replace may not be atomic on some platforms; fallback to rename
-                os.rename(temp, path)
-            self._toggle_state_mtime = self._get_toggle_state_mtime()
-            self._logger.debug(f"Persisted AI background fallback mode to {path}: {self._ai_bg_fallback_mode}")
+                self._landscape_rotate_degrees = self._decode_rotation_value(
+                    landscape_raw if landscape_raw is not None else data.get('landscape_rotate_degrees'),
+                    'landscape',
+                    self._landscape_rotate_degrees,
+                )
+
+            self._display_service.set_orientation(
+                self._orientation,
+                portrait_rotate_degrees=self._portrait_rotate_degrees,
+                landscape_rotate_degrees=self._landscape_rotate_degrees,
+            )
+            self._logger.info("Loaded toggle state from database: ai_bg_fallback_mode=%s", self._ai_bg_fallback_mode)
+            self._logger.info("Loaded toggle state from database: music_detection_enabled=%s", self._music_detection_enabled)
+            self._logger.info(
+                "Loaded display orientation=%s, portrait_rotate=%s, landscape_rotate=%s",
+                self._orientation,
+                self._portrait_rotate_degrees,
+                self._landscape_rotate_degrees,
+            )
         except Exception as e:
-            self._logger.warning(f"Failed to persist toggle state to {path}: {e}")
+            self._logger.warning(f"Failed to load toggle state from database: {e}")
+
+    def _encode_rotation_bool(self, p_deg: int, l_deg: int) -> bool:
+        p_bool = True if p_deg == 270 else False if p_deg == 0 else None
+        l_bool = True if l_deg == 180 else False if l_deg == 0 else None
+        if p_bool is not None and l_bool is not None and p_bool == l_bool:
+            return p_bool
+        if p_bool is not None:
+            return p_bool
+        if l_bool is not None:
+            return l_bool
+        return True
+
+    def _save_toggle_state_to_store(self) -> None:
+        try:
+            self._settings_store.save_toggle_state(
+                {
+                    'ai_bg_fallback_mode': bool(self._ai_bg_fallback_mode),
+                    'music_detection_enabled': bool(self._music_detection_enabled),
+                    'orientation': self._orientation,
+                    'rotation': self._encode_rotation_bool(self._portrait_rotate_degrees, self._landscape_rotate_degrees),
+                }
+            )
+            self._toggle_state_version = self._get_toggle_state_version()
+            self._logger.debug(
+                "Persisted toggle state to database: ai_bg_fallback_mode=%s, music_detection_enabled=%s",
+                self._ai_bg_fallback_mode,
+                self._music_detection_enabled,
+            )
+        except Exception as e:
+            self._logger.warning(f"Failed to persist toggle state to database: {e}")
 
 
 if __name__ == "__main__":

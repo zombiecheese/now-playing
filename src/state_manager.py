@@ -73,6 +73,7 @@ class StateManager:
             self._logger.debug("Display should be cleaned to avoid 'ghosting' from previous images.")
             self._image_counter = 0
             return True
+        return False
 
     def no_music_detected_for_more_than_a_minute(self) -> bool:
         if self._last_music_detected_time is None:
@@ -95,10 +96,15 @@ class StateManager:
     def screensaver_still_up_but_weather_info_outdated(self) -> bool:
         if self._state.current != DisplayState.SCREENSAVER:
             return False
-        elapsed_time = datetime.datetime.now() - self._get_screensaver_state().weather_info.fetched_at
+        screensaver_state = self._get_screensaver_state()
+        weather_info = screensaver_state.weather_info
+        if weather_info is None or weather_info.fetched_at is None:
+            return True
+        elapsed_time = datetime.datetime.now() - weather_info.fetched_at
         if elapsed_time >= datetime.timedelta(minutes=60):
             self._logger.info("Weather info outdated.")
             return True
+        return False
 
     def get_state(self) -> AppState:
         return self._state

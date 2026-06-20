@@ -25,8 +25,7 @@ All credits for the original idea go to them. While they laid the groundwork, th
   local [YAMNet](https://www.kaggle.com/models/google/yamnet/tensorFlow2/yamnet/1?tfhub-redirect=true) ML model
 - When music is detected, identifies the song with [ShazamIO](https://github.com/shazamio/ShazamIO)
 - Displays song title, artist, and album cover on an e-ink display
-- **Button A**: Adds the currently playing song to your Spotify playlist
-  with [Spotipy](https://spotipy.readthedocs.io/en/2.25.1/)
+- **Button A**: Toggles music detection and song lookup on/off
 - **Button B**: Toggles AI background generation on/off (switches between generated backgrounds and static fallback images)
 - **Button C**: Cycles through display orientations (portrait/landscape) and rotations
 - **AI-Generated Backgrounds**: Uses OpenAI's image generation to create weather-aware, time-of-day appropriate screensaver backgrounds
@@ -34,8 +33,11 @@ All credits for the original idea go to them. While they laid the groundwork, th
 
 ## 🎮 Button Controls
 
-### Button A - Add to Spotify Playlist
-When a song is playing, press Button A to add the current track to your configured Spotify playlist.
+### Button A - Toggle Music Detection & Lookup
+Press Button A to toggle the audio pipeline:
+- **Enabled** (default): Microphone capture, music detection, and Shazam lookup run normally
+- **Disabled**: Music detection/lookup pauses and the display remains in weather/screensaver flow
+- This state is persisted and is reflected in the admin portal General settings
 
 ### Button B - Toggle AI Background Mode
 Press Button B to toggle between AI-generated backgrounds and static fallback images for the screensaver:
@@ -78,7 +80,7 @@ The display immediately redraws with the new orientation, and your preference is
   display)
 - Application state is handled via a centralized `StateManager`
 - Type hints added for better clarity and IDE support
-- Configurations via YAML (no more messy INI files)
+- Configurations via the admin portal backed by SQLite (no more messy INI files)
 - Cleaned up setup script for smoother installation
 - Singleton pattern for `Logger` and `Config`
 - Threaded button control for responsiveness
@@ -134,32 +136,16 @@ The display immediately redraws with the new orientation, and your preference is
 3. Click on 'Save'
 4. Store your Client ID and Client Secret, you will need it later
 
-#### 🆔 Spotify Playlist ID
-
-1. [Copy the Playlist ID](https://clients.caster.fm/knowledgebase/110/How-to-find-Spotify-playlist-ID.html#:~:text=To%20find%20the%20Spotify%20playlist,Link%22%20under%20the%20Share%20menu.&text=The%20playlist%20id%20is%20the,after%20playlist%2F%20as%20marked%20above.)
-   of the playlist you want your songs to be added to
-2. Store it, you will need it later
-
 #### 🎟 Spotify Access Token
 
-Since Raspberry Pi OS Lite is headless (no browser), you must authorize Spotify once from a computer:
+Spotify authorization is now handled from the web admin portal:
 
-1. On your computer, clone this repo:
+1. Open the admin portal in your browser.
+2. Enter your Spotify client ID and client secret in the portal.
+3. Click **Open Spotify Login** in the Spotify Authorization section.
+4. Complete the Spotify consent screen, then return to the portal and refresh the auth status.
 
-```bash 
-  git https://github.com/zombiecheese/now-playing
-  cd now-playing
-```
-
-2. Fill in your `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` in `spotify_auth_helper.py`
-3. Run the script:
-
-```bash
-  python3 spotify_auth_helper.py
-```
-
-4. Follow the browser prompt and allow access to your Spotify account. This will generate a .cache file locally
-   containing your Spotify access token.
+The access token and refresh token are stored in the SQLite settings database, so there is no separate `.cache` file to copy around anymore.
 
 ### ⚙️ Installation Script
 
@@ -177,9 +163,7 @@ And run:
   bash ./setup.sh
 ```
 
-Afterwards, copy the .cache file from your local computer to the now-playing project root. Spotipy will from now on
-automatically refresh the
-access token when it expires (using the refresh token present in the .cache file)
+Spotipy will now automatically refresh the access token when it expires, using the refresh token stored in the database.
 
 The `setup.sh` script will automatically start the now-playing systemd service. Verify that the service starts without
 errors:
@@ -196,110 +180,15 @@ Should you encounter any errors, check [Known Issues](#-known-issues)
 > - Updates the system and installs dependencies
 > - Sets up a Python virtual environment and installs Python packages
 > - Creates config, log, and resources directories
-> - Prompts for credentials, your e-ink display size and generates config.yaml
+> - Starts the service and lets the admin portal initialize the SQLite settings store
 > - Copies and configures a systemd service to autostart on boot
 > - Starts the now-playing service
 
-> 📂 <b>Configuration File (config.yaml)</b>
+> 📂 <b>Settings Store (SQLite)</b>
 >
-> The `config.yaml` file controls all aspects of the application's behavior. Here's a comprehensive breakdown:
->
-> ```yaml
-> display:
->   # Hardware settings
->   width: 800                          # Display width in pixels (640 for 4", 600 for 5.7", 800 for 7.3")
->   height: 480                         # Display height in pixels (400 for 4", 448 for 5.7", 480 for 7.3")
->   
->   # Font configuration
->   font_path: "resources/CircularStd-Bold.otf"  # Path to font file
->   font_size_title: 45                 # Font size for song title
->   font_size_subtitle: 30              # Font size for artist name
->   
->   # Text positioning (per orientation)
->   text_offset_left_px_landscape: 0    # Left margin for landscape mode
->   text_offset_right_px_landscape: 0   # Right margin for landscape mode
->   text_offset_top_px_landscape: 0     # Top margin for landscape mode
->   text_offset_bottom_px_landscape: 0  # Bottom margin for landscape mode
->   text_offset_text_shadow_px_landscape: 4  # Shadow offset for landscape
->   
->   text_offset_left_px_portrait: 5     # Left margin for portrait mode
->   text_offset_right_px_portrait: 20   # Right margin for portrait mode
->   text_offset_top_px_portrait: 0      # Top margin for portrait mode
->   text_offset_bottom_px_portrait: 80  # Bottom margin for portrait mode
->   text_offset_text_shadow_px_portrait: 4  # Shadow offset for portrait
->   
->   # Album art positioning (per orientation)
->   album_offset_left_px_landscape: 0   # Album art left offset (landscape)
->   album_offset_right_px_landscape: 0  # Album art right offset (landscape)
->   album_offset_top_px_landscape: 0    # Album art top offset (landscape)
->   album_offset_bottom_px_landscape: 0 # Album art bottom offset (landscape)
->   
->   album_offset_left_px_portrait: 0    # Album art left offset (portrait)
->   album_offset_right_px_portrait: 14  # Album art right offset (portrait)
->   album_offset_top_px_portrait: 49    # Album art top offset (portrait)
->   album_offset_bottom_px_portrait: 0  # Album art bottom offset (portrait)
->   
->   # Visual styling
->   backdrop_blur_radius: 12            # Blur radius for album backdrop (0 to disable)
->   backdrop_darken_alpha: 120          # Backdrop darkening (0-255, 0 to disable)
->   backdrop_use_gradient: false        # Use gradient instead of blurred image
->   small_album_cover_px: 450           # Size of album cover in pixels
->   
->   # Background images
->   weather_background_image: "resources/ai_screensaver.png"  # AI-generated background path
->   portrait_album_background_color: "black"  # Background color behind album art in portrait
->   
->   # Text layout
->   text_alignment_portrait: "center"   # Text alignment in portrait: "left"|"center"|"right"
->   text_alignment_landscape: "left"    # Text alignment in landscape: "left"|"center"|"right"
->   text_wrap_break_long_words: true    # Break long words if needed
->   text_wrap_hyphenate: false          # Add hyphens at line breaks
->   text_line_spacing_px: 4             # Extra spacing between wrapped lines
-> 
-> weather:
->   openweathermap_api_key: "YOUR_API_KEY"     # Get from openweathermap.org
->   geo_coordinates: "LAT,LON"                 # Format: "latitude,longitude"
->   background_refresh_seconds: 3600            # How often to generate new backgrounds (seconds)
->   timezone: "Australia/Melbourne"             # Your timezone for day/night calculation
-> 
-> spotify:
->   client_id: "YOUR_SPOTIFY_CLIENT_ID"        # From Spotify Developer Dashboard
->   client_secret: "YOUR_SPOTIFY_CLIENT_SECRET" # From Spotify Developer Dashboard
->   playlist_id: "YOUR_SPOTIFY_PLAYLIST_ID"    # Playlist to add songs to (Button A)
-> 
-> orchestrator:
->   debounce_seconds: 30                # Skip re-render if same track within N seconds
->   cache_ttl_seconds: 86400            # Keep album/year enrichment for 1 day
->   cache_size: 512                     # Maximum cache entries
->   cache_file_path: "cache/enrichment_cache.json"  # Optional disk persistence
-> 
-> log:
->   log_file_path: "log/now_playing.log"  # Application log file path
-> 
-> openai:
->   api_key: "YOUR_OPENAI_API_KEY"      # Get from platform.openai.com
->   prompt_style: "80s anime"            # Artistic style: "80s anime", "cyberpunk", "impressionist painting", etc.
->   model: "gpt-image-1-mini"            # Model: "dall-e-2", "dall-e-3", "gpt-image-1.X"
-> 
-> image:
->   orientation_strategy: "cover"       # How to fit images: "cover" or "contain"
->   max_square_size: 1024               # Max dimension for square images (DALL-E 2 fallback)
->
->   # Orientation + time-of-day specific fallbacks (preferred)
->   fallback_image_path_day_portrait: "resources/portrait_default_day.png"
->   fallback_image_path_night_portrait: "resources/portrait_default_night.png"
->   fallback_image_path_day_landscape: "resources/landscape_default_day.png"
->   fallback_image_path_night_landscape: "resources/landscape_default_night.png"
->
->   # Legacy single fallback (used if orientation-aware images are missing)
->   fallback_image_path: "resources/default.jpg"
-> 
-> lighting:
->   # These prompts inform the AI how to render lighting based on time of day
->   day: "Use daytime lighting: natural brightness, appropriate color temperature, balanced contrast, and realistic shadows."
->   twilight: "Use twilight lighting: soft low-angle light, gentle shadows, a sky gradient, moderate contrast, and selective artificial lights beginning to appear."
->   night: "Render with low-light exposure: markedly darker scene, high contrast, cooler ambient tones, visible artificial lighting (street lamps, train interiors/headlights, illuminated windows), reduced sky luminance."
-> ```
+> The app now stores configuration in a disk-backed SQLite settings store that is initialized and edited through the admin portal.
+> The portal exposes the same layout, image, weather, Spotify, OpenAI, audio, logging, and orientation settings as form controls.
+> Legacy YAML and JSON files are only used as one-time migration inputs when present.
 
 ## 🛠 Useful Commands
 
@@ -307,15 +196,35 @@ Should you encounter any errors, check [Known Issues](#-known-issues)
 
 To update your configuration after installation:
 
+Open the admin portal and save changes there. The portal persists settings to the SQLite store and applies runtime toggle changes immediately.
+
+### 🌐 Web Configuration Manager
+
+You can manage the SQLite-backed settings store from a browser and preview the currently selected screensaver image.
+
+The web manager starts automatically when `now_playing.py` starts (including when run by systemd).
+
+Run the manager:
+
 ```bash
-  nano config/config.yaml
+  source venv/bin/activate
+  python3 src/config_web_interface.py --host 0.0.0.0 --port 8088
 ```
 
-After editing, restart the service to apply changes:
+Then open:
 
-```bash
-  sudo systemctl restart now-playing.service
+```text
+  http://<your-pi-ip>:8088
 ```
+
+What it supports:
+- Structured editing of all supported settings through the admin form
+- Automatic backups of the SQLite database before config saves
+- Current display preview image including rendered overlays (song/weather text, orientation, AI indicator dot)
+
+Notes:
+- The portal persists changes directly to the database; no manual file editing is required
+- The image preview is based on current fallback mode, orientation, and day/night assumptions
 
 ### � Update Script
 
@@ -328,12 +237,12 @@ The `update.sh` script makes updating your installation simple and safe:
 **What it does:**
 - Stops the now-playing service
 - Fetches the latest code from the GitHub repository
-- Resets your installation to the latest version (preserves your config files)
+- Resets your installation to the latest version (preserves the SQLite settings database and cache files)
 - Updates Python dependencies to their latest versions
 - Prompts you to restart the service
 
 **Important Notes:**
-- Your `config/config.yaml` and `.cache` files are preserved
+- Your SQLite settings database is preserved
 - Must be run as a regular user (not root)
 - Requires an active internet connection
 - After completion, manually restart the service:
@@ -383,14 +292,14 @@ To leave the virtual environment:
 
 ## 🎨 Fine-Tuning Display Layout
 
-The `config.yaml` file provides extensive control over text and image positioning, allowing you to perfectly align elements for your specific display and aesthetic preferences.
+The admin portal exposes extensive control over text and image positioning, allowing you to perfectly align elements for your specific display and aesthetic preferences.
 
 ### Text Offset Configuration
 
 Text offsets control the margins and shadow effects for song information. Configure separately for each orientation:
 
 **Landscape Mode:**
-```yaml
+```text
 text_offset_left_px_landscape: 0      # Distance from left edge
 text_offset_right_px_landscape: 0     # Distance from right edge
 text_offset_top_px_landscape: 0       # Distance from top
@@ -399,7 +308,7 @@ text_offset_text_shadow_px_landscape: 4  # Shadow depth for text readability
 ```
 
 **Portrait Mode:**
-```yaml
+```text
 text_offset_left_px_portrait: 5       # Distance from left edge
 text_offset_right_px_portrait: 20     # Distance from right edge
 text_offset_top_px_portrait: 0        # Distance from top
@@ -412,7 +321,7 @@ text_offset_text_shadow_px_portrait: 4   # Shadow depth for text readability
 Album art offsets allow precise positioning of the album cover image:
 
 **Landscape Mode:**
-```yaml
+```text
 album_offset_left_px_landscape: 0     # Move album art left/right
 album_offset_right_px_landscape: 0    # Adjust right-side spacing
 album_offset_top_px_landscape: 0      # Move album art up/down
@@ -420,7 +329,7 @@ album_offset_bottom_px_landscape: 0   # Adjust bottom spacing
 ```
 
 **Portrait Mode:**
-```yaml
+```text
 album_offset_left_px_portrait: 0      # Move album art left/right
 album_offset_right_px_portrait: 14    # Adjust right-side spacing
 album_offset_top_px_portrait: 49      # Move album art up/down
@@ -443,7 +352,7 @@ album_offset_bottom_px_portrait: 0    # Adjust bottom spacing
 
 In addition to offsets, you can control text alignment:
 
-```yaml
+```text
 text_alignment_portrait: "center"    # Options: "left", "center", "right"
 text_alignment_landscape: "left"     # Options: "left", "center", "right"
 ```
@@ -451,7 +360,7 @@ text_alignment_landscape: "left"     # Options: "left", "center", "right"
 ### Common Layout Scenarios
 
 **Centered Layout (Portrait):**
-```yaml
+```text
 text_alignment_portrait: "center"
 text_offset_left_px_portrait: 20
 text_offset_right_px_portrait: 20
@@ -459,14 +368,14 @@ text_offset_bottom_px_portrait: 40
 ```
 
 **Left-Aligned with Album on Right (Landscape):**
-```yaml
+```text
 text_alignment_landscape: "left"
 text_offset_left_px_landscape: 20
 album_offset_right_px_landscape: 20
 ```
 
 **Bottom-Aligned Text (Portrait):**
-```yaml
+```text
 text_offset_bottom_px_portrait: 100   # Push text to bottom
 album_offset_top_px_portrait: 20      # Album at top
 ```

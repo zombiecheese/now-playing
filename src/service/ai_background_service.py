@@ -154,29 +154,21 @@ class AIBackgroundService:
 
     def _get_current_orientation(self) -> str:
         """
-        Return the current orientation, preferring config/toggle_state.json when present.
+        Return the current orientation from the shared settings database.
         Falls back to the display config's orientation or "portrait".
         """
         orientation = (self._display_orientation or "portrait").lower()
         try:
-            # This file lives in src/service; config folder is at project root: ../../config
-            cfg_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'config'))
-            ts_path = os.path.join(cfg_dir, 'toggle_state.json')
-            if os.path.exists(ts_path):
-                with open(ts_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    o = (data.get('orientation') or orientation or 'portrait').lower()
-                    if o in ("portrait", "landscape"):
-                        try:
-                            self._logger.debug("Orientation from toggle_state at %s: %s", ts_path, o)
-                        except Exception:
-                            pass
-                        return o
-            else:
+            from settings_store import SettingsStore
+
+            data = SettingsStore().load_toggle_state()
+            o = (data.get('orientation') or orientation or 'portrait').lower()
+            if o in ("portrait", "landscape"):
                 try:
-                    self._logger.debug("toggle_state.json not found at %s; using default orientation '%s'", ts_path, orientation)
+                    self._logger.debug("Orientation from settings database: %s", o)
                 except Exception:
                     pass
+                return o
         except Exception as e:
             try:
                 self._logger.debug("Orientation read failed; using default '%s': %s", orientation, e)
@@ -413,7 +405,7 @@ class AIBackgroundService:
             # Default to day for safety; path presence is validated below.
             is_day = True
 
-        # Determine current orientation, preferring toggle_state.json if present
+        # Determine current orientation from the shared settings store
         orientation = self._get_current_orientation()
 
         # 1) Orientation-aware day/night specific paths

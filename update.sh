@@ -21,9 +21,6 @@ install_path=$(pwd)
 source "${install_path}/venv/bin/activate" && echo "✔ Virtual environment activated."
 echo "==> upgrading required Python packages..."
 pip3 install -r requirements.txt --upgrade && echo "✔ Python packages installed successfully."
-echo "Dectivating the virtual environment..."
-source "${install_path}/venv/bin/deactivate" && echo "✔ Virtual environment activated."
-
-
-echo "==> run systemctl start now-playing"
+echo "==> restarting now-playing service..."
+sudo systemctl restart now-playing
 echo "🎉 Update is complete! Your now-playing display is configured."

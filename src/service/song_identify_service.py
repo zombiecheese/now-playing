@@ -3,6 +3,8 @@ import asyncio
 import logging
 from typing import Optional, Dict
 import io
+import threading
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from shazamio import Shazam
 from dataclasses import dataclass
 
@@ -24,14 +26,16 @@ class SongIdentifyService:
     def __init__(self) -> None:
         self._logger: logging.Logger = Logger().get_logger()
         self._shazam: Shazam = Shazam()
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._loop_thread.start()
 
-    async def identify(self, audio_wav_buffer: io.BytesIO) -> Optional["SongInfo"]:
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    async def _identify_bytes(self, audio_bytes: bytes) -> Optional["SongInfo"]:
         try:
-            # Ensure we read from the start of the buffer
-            audio_wav_buffer.seek(0)
-            audio_bytes = audio_wav_buffer.read()
-
-            # Use the modern Rust-backed API
             result = await self._shazam.recognize(audio_bytes)
 
             if not result or "track" not in result:
@@ -41,7 +45,6 @@ class SongIdentifyService:
             self._logger.info("Song identified in the provided audio buffer.")
             song = SongIdentifyService._parse_result(result)
 
-            # Best-effort detailed logging
             try:
                 self._logger.info(
                     "Identified song: Title=%s; Artist=%s; Album=%s; Year=%s; AlbumArt=%s",
@@ -55,6 +58,15 @@ class SongIdentifyService:
                 self._logger.exception("Failed to log detailed song information.")
 
             return song
+        except Exception as ex:
+            self._logger.error("Error identifying song: %s", ex, exc_info=True)
+            return None
+
+    async def identify(self, audio_wav_buffer: io.BytesIO) -> Optional["SongInfo"]:
+        try:
+            audio_wav_buffer.seek(0)
+            audio_bytes = audio_wav_buffer.read()
+            return await self._identify_bytes(audio_bytes)
 
         except Exception as ex:
             self._logger.error("Error identifying song: %s", ex, exc_info=True)
@@ -63,11 +75,20 @@ class SongIdentifyService:
     def identify_sync(self, audio_wav_buffer: io.BytesIO) -> Optional["SongInfo"]:
         """Synchronous wrapper for compatibility with existing callers.
 
-        Uses asyncio.run() to execute the async `identify` method when called
-        from synchronous code paths.
+        Uses a persistent background event loop to avoid per-call loop startup cost.
         """
         try:
-            return asyncio.run(self.identify(audio_wav_buffer))
+            audio_wav_buffer.seek(0)
+            audio_bytes = audio_wav_buffer.read()
+
+            if not self._loop.is_running():
+                return asyncio.run(self._identify_bytes(audio_bytes))
+
+            future = asyncio.run_coroutine_threadsafe(self._identify_bytes(audio_bytes), self._loop)
+            return future.result(timeout=25)
+        except FutureTimeoutError:
+            self._logger.error("Song identify timed out.", exc_info=True)
+            return None
         except Exception as ex:
             self._logger.error("Error identifying song (sync wrapper): %s", ex, exc_info=True)
             return None

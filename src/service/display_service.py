@@ -2,6 +2,7 @@
 import logging
 import time
 import traceback
+import os
 from io import BytesIO
 from typing import Optional, Tuple
 
@@ -55,6 +56,12 @@ class DisplayService:
 
         # Weather background (file path optional)
         self._weather_bg_path = dcfg.get("weather_background_image") or dcfg.get("screensaver_image")
+
+        # Persist the final rendered frame (with overlays) for web preview.
+        web_cfg = self._config.get("web_interface", {}) if isinstance(self._config.get("web_interface", {}), dict) else {}
+        preview_default = os.path.join(os.path.dirname(__file__), "..", "..", "config", "current_display_preview.png")
+        preview_cfg = web_cfg.get("preview_image_path")
+        self._preview_image_path = os.path.abspath(preview_cfg) if preview_cfg else os.path.abspath(preview_default)
 
         # Text layout options
         self._text_alignment_portrait = (dcfg.get("text_alignment_portrait") or "left").lower()
@@ -1038,7 +1045,7 @@ class DisplayService:
                     # Margins scale with aspect ratio and orientation
                     w, h = image.size
                     short = min(w, h)
-                    # Get current orientation from toggle_state.json (if available)
+                    # Get current orientation from the shared settings store
                     runtime_orientation = self._get_runtime_orientation()
                     # Apply margin scaling based on orientation
                     if runtime_orientation == "portrait":
@@ -1060,6 +1067,13 @@ class DisplayService:
                     # Non-fatal drawing error; continue to display image
                     pass
 
+            # Save the exact final frame for the web management preview.
+            try:
+                os.makedirs(os.path.dirname(self._preview_image_path), exist_ok=True)
+                image.save(self._preview_image_path, format="PNG")
+            except Exception as e:
+                self._logger.warning(f"Could not persist display preview image: {e}")
+
             self._inky.set_image(image, saturation=saturation)
             self._inky.show()
         except Exception as e:
@@ -1072,21 +1086,15 @@ class DisplayService:
 
     def _get_runtime_orientation(self) -> str:
         """
-        Read the current orientation from toggle_state.json if it exists.
-        Falls back to self._orientation if file is missing or unreadable.
+        Read the current orientation from the shared settings database.
+        Falls back to self._orientation if the toggle state is missing or unreadable.
         """
         try:
-            import os
-            import json
-            cfg_dir = self._config.get("config_dir", os.path.dirname(os.path.abspath(__file__)))
-            # Adjust path to find config directory
-            base_dir = os.path.dirname(os.path.dirname(os.path.dirname(cfg_dir)))
-            ts_path = os.path.join(base_dir, "config", "toggle_state.json")
-            if os.path.isfile(ts_path):
-                with open(ts_path, "r") as f:
-                    toggle_state = json.load(f)
-                    o = toggle_state.get("orientation", self._orientation)
-                    return o.lower() if o else self._orientation
+            from settings_store import SettingsStore
+
+            toggle_state = SettingsStore().load_toggle_state()
+            o = toggle_state.get("orientation", self._orientation)
+            return o.lower() if o else self._orientation
         except Exception:
             pass
         return self._orientation

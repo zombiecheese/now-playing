@@ -1,4 +1,3 @@
-# weather_service.py (suggested patch)
 import datetime
 import logging
 from typing import Dict, Optional, Any
@@ -9,8 +8,7 @@ sys.path.append("..")
 from logger import Logger
 from util import Util
 from config import Config
-from openai import OpenAI
-import base64
+from settings_store import SettingsStore
 
 @dataclass(frozen=True)
 class WeatherInfo:
@@ -23,7 +21,14 @@ class WeatherService:
         self._logger: logging.Logger = Logger().get_logger()
         self._config: dict = Config().get_config()
         self._refresh_seconds = refresh_seconds
+        self._settings_store = SettingsStore()
         self._cached_info: Optional[WeatherInfo] = None
+
+        try:
+            persisted = self._settings_store.load_weather_cache()
+            self._cached_info = self._deserialize_weather_info(persisted)
+        except Exception:
+            self._cached_info = None
 
     def _build_request_url(self) -> str:
         base_url = "https://api.openweathermap.org/data/2.5/weather"
@@ -56,6 +61,31 @@ class WeatherService:
             self._logger.error(f"Error processing weather data: missing key {e}")
             return WeatherService._default_weather_info()
 
+    def _serialize_weather_info(self, weather_info: WeatherInfo) -> Dict[str, Any]:
+        return {
+            "temperature": weather_info.temperature,
+            "sub_description": weather_info.sub_description,
+            "fetched_at": weather_info.fetched_at.isoformat() if weather_info.fetched_at else None,
+        }
+
+    def _deserialize_weather_info(self, payload: Optional[Dict[str, Any]]) -> Optional[WeatherInfo]:
+        if not isinstance(payload, dict):
+            return None
+
+        fetched_at_raw = payload.get("fetched_at")
+        fetched_at = None
+        if isinstance(fetched_at_raw, str) and fetched_at_raw:
+            try:
+                fetched_at = datetime.datetime.fromisoformat(fetched_at_raw)
+            except ValueError:
+                fetched_at = None
+
+        return WeatherInfo(
+            temperature=payload.get("temperature") if isinstance(payload.get("temperature"), str) else None,
+            sub_description=payload.get("sub_description") if isinstance(payload.get("sub_description"), str) else None,
+            fetched_at=fetched_at,
+        )
+
     def get_weather_info(self) -> WeatherInfo:
         # Return cached value if still fresh
         if self._cached_info and self._cached_info.fetched_at:
@@ -69,6 +99,10 @@ class WeatherService:
             return self._cached_info or WeatherService._default_weather_info()
 
         self._cached_info = self._extract_weather_info(raw_data)
+        try:
+            self._settings_store.save_weather_cache(self._serialize_weather_info(self._cached_info))
+        except Exception:
+            self._logger.debug("Failed to persist weather cache to settings database.")
         return self._cached_info
 
     @staticmethod
@@ -76,5 +110,5 @@ class WeatherService:
         return WeatherInfo(
             temperature="inf",
             sub_description="No weather info",
-                       fetched_at=datetime.datetime.now()
-         )
+            fetched_at=datetime.datetime.now()
+        )
