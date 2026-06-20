@@ -12,7 +12,6 @@ import gpiod
 import gpiodevice
 from gpiod.line import Bias, Direction, Edge
 import threading
-from config_web_interface import run_server as run_config_web_server
 
 # Local imports
 from logger import Logger
@@ -25,7 +24,6 @@ from service.audio_recording_service import AudioRecordingService
 from service.music_detection_service import MusicDetectionService
 from service.weather_service import WeatherService, WeatherInfo
 from service.display_service import DisplayService
-from service.spotify_service import SpotifyService
 from service.ai_background_service import AIBackgroundService
 
 class NowPlaying:
@@ -83,18 +81,11 @@ class NowPlaying:
         self._song_identify_service: SongIdentifyService = SongIdentifyService()
         self._weather_service: WeatherService = WeatherService()  # 15-min cache TTL by default
         self._display_service: DisplayService = DisplayService()
-        self._spotify_service: SpotifyService = SpotifyService()
         self._state_manager: StateManager = StateManager()
 
-        # Config web interface settings (served alongside the main app by default)
-        web_cfg = self._config.get("web_interface", {})
-        self._web_enabled: bool = bool(web_cfg.get("enabled", True))
-        self._web_host: str = str(web_cfg.get("host", "0.0.0.0"))
-        self._web_port: int = int(web_cfg.get("port", 8088))
-
-        # NEW: OpenAI background generator (uses weather.background_refresh_seconds from config)
         self._ai_bg: AIBackgroundService = AIBackgroundService()
         self._settings_store: SettingsStore = SettingsStore()
+        self._openai_enabled: bool = True
         # When True: force using AI background fallback images (no generation)
         self._ai_bg_fallback_mode: bool = False
         self._music_detection_enabled: bool = True
@@ -114,7 +105,6 @@ class NowPlaying:
         # Initial housekeeping
         self._bg_refresh_queue: queue.Queue[str] = queue.Queue(maxsize=1)
         self._start_background_refresh_worker()
-        self._start_web_interface_if_enabled()
         self._clean_display_and_set_clean_state()
         self._setup_buttons()
         self._start_button_listener()
@@ -141,32 +131,6 @@ class NowPlaying:
         except queue.Full:
             self._logger.debug("Skipped queueing AI background refresh (%s): request already pending", reason)
 
-    def _start_web_interface_if_enabled(self) -> None:
-        if not self._web_enabled:
-            self._logger.info("Config web interface is disabled via config.web_interface.enabled")
-            return
-
-        def serve_web() -> None:
-            try:
-                run_config_web_server(self._web_host, self._web_port)
-            except OSError as e:
-                self._logger.warning(
-                    "Config web interface failed to bind on %s:%s (%s). Continuing without web interface.",
-                    self._web_host,
-                    self._web_port,
-                    e,
-                )
-            except Exception as e:
-                self._logger.warning(f"Config web interface stopped unexpectedly: {e}")
-
-        thread = threading.Thread(target=serve_web, daemon=True)
-        thread.start()
-        self._logger.info(
-            "Config web interface started on http://%s:%s",
-            self._web_host,
-            self._web_port,
-        )
-
     def _bootstrap_preview_frame_if_missing(self) -> None:
         web_cfg = self._config.get("web_interface", {}) if isinstance(self._config.get("web_interface", {}), dict) else {}
         preview_path = web_cfg.get("preview_image_path") or os.path.join(os.path.dirname(__file__), "..", "config", "current_display_preview.png")
@@ -178,7 +142,7 @@ class NowPlaying:
         try:
             weather_info = self._weather_service.get_weather_info()
             fallback_path = None
-            show_dot = self._ai_bg_fallback_mode
+            show_dot = self._should_show_ai_dot()
             if self._ai_bg_fallback_mode:
                 try:
                     fallback_path = self._ai_bg.get_fallback_path()
@@ -238,7 +202,7 @@ class NowPlaying:
             # Music is present but no match; show weather/screensaver immediately instead of staying blank
             try:
                 fallback_path = None
-                show_dot = self._ai_bg_fallback_mode
+                show_dot = self._should_show_ai_dot()
                 if self._ai_bg_fallback_mode:
                     try:
                         fallback_path = self._ai_bg.get_fallback_path()
@@ -275,6 +239,10 @@ class NowPlaying:
         self._display_service.update_display_to_playing(song_info)
         self._state_manager.increase_image_counter()
 
+    def _should_show_ai_dot(self) -> bool:
+        # Only show the red indicator when AI generation is disabled in admin settings.
+        return not self._openai_enabled
+
     # --- No music -> screensaver/weather ---
     def _handle_no_music_detected(self) -> None:
         """
@@ -300,8 +268,13 @@ class NowPlaying:
             weather_info = self._weather_service.get_weather_info()
             # Determine whether to force a time-relevant fallback image and show the indicator dot
             fallback_path = None
-            show_dot = self._ai_bg_fallback_mode
-            self._logger.info(f"AI fallback mode: {self._ai_bg_fallback_mode}, show_dot: {show_dot}")
+            show_dot = self._should_show_ai_dot()
+            self._logger.info(
+                "AI fallback mode=%s, openai_enabled=%s, show_dot=%s",
+                self._ai_bg_fallback_mode,
+                self._openai_enabled,
+                show_dot,
+            )
             try:
                 if self._ai_bg_fallback_mode:
                     fallback_path = self._ai_bg.get_fallback_path()
@@ -338,12 +311,10 @@ class NowPlaying:
             elif current_state == DisplayState.SCREENSAVER:
                 weather_info = self._weather_service.get_weather_info()
                 fallback_path = None
-                show_dot = False
+                show_dot = self._should_show_ai_dot()
                 try:
                     if self._ai_bg_fallback_mode:
                         fallback_path = self._ai_bg.get_fallback_path()
-                        if fallback_path:
-                            show_dot = True
                 except Exception:
                     fallback_path = None
                 self._display_service.update_display_to_screensaver(
@@ -432,6 +403,35 @@ class NowPlaying:
         A small red dot will be shown on the screensaver when the fallback image is available.
         """
         try:
+            if not self._openai_enabled:
+                self._ai_bg_fallback_mode = True
+                try:
+                    self._save_toggle_state_to_store()
+                except Exception as e:
+                    self._logger.warning(f"Failed to persist toggle state: {e}")
+
+                self._logger.info(
+                    "AI background generation is disabled via admin portal; forcing fallback mode on."
+                )
+
+                if (
+                    self._state_manager.get_state().current == DisplayState.SCREENSAVER
+                    or self._state_manager.no_music_detected_for_more_than_a_minute()
+                ):
+                    weather_info = self._weather_service.get_weather_info()
+                    fallback_path = None
+                    show_dot = self._should_show_ai_dot()
+                    try:
+                        fallback_path = self._ai_bg.get_fallback_path()
+                    except Exception:
+                        fallback_path = None
+                    self._set_screensaver_state_and_update_display(
+                        weather_info,
+                        show_ai_dot=show_dot,
+                        fallback_image_path=fallback_path,
+                    )
+                return
+
             prev = bool(self._ai_bg_fallback_mode)
             self._ai_bg_fallback_mode = not prev
             try:
@@ -453,12 +453,10 @@ class NowPlaying:
                 weather_info = self._weather_service.get_weather_info()
                 # Decide fallback path and dot visibility
                 fallback_path = None
-                show_dot = False
+                show_dot = self._should_show_ai_dot()
                 try:
                     if self._ai_bg_fallback_mode:
                         fallback_path = self._ai_bg.get_fallback_path()
-                        if fallback_path:
-                            show_dot = True
                 except Exception:
                     fallback_path = None
 
@@ -531,7 +529,7 @@ class NowPlaying:
                 # Redraw the screensaver with current weather
                 weather_info = self._weather_service.get_weather_info()
                 fallback_path = None
-                show_dot = self._ai_bg_fallback_mode
+                show_dot = self._should_show_ai_dot()
                 try:
                     if self._ai_bg_fallback_mode:
                         fallback_path = self._ai_bg.get_fallback_path()
@@ -579,7 +577,10 @@ class NowPlaying:
     def _load_toggle_state_from_store(self) -> None:
         try:
             data = self._settings_store.load_toggle_state()
-            self._ai_bg_fallback_mode = bool(data.get('ai_bg_fallback_mode', False))
+            self._openai_enabled = bool(data.get('openai_enabled', True))
+            manual_fallback_mode = bool(data.get('ai_bg_fallback_mode', False))
+            # Admin openai_enabled=False must always force runtime fallback behavior.
+            self._ai_bg_fallback_mode = (not self._openai_enabled) or manual_fallback_mode
             self._music_detection_enabled = bool(data.get('music_detection_enabled', True))
             self._orientation = (data.get('orientation') or self._orientation).lower()
 
@@ -610,7 +611,13 @@ class NowPlaying:
                 portrait_rotate_degrees=self._portrait_rotate_degrees,
                 landscape_rotate_degrees=self._landscape_rotate_degrees,
             )
-            self._logger.info("Loaded toggle state from database: ai_bg_fallback_mode=%s", self._ai_bg_fallback_mode)
+            self._logger.info("Loaded toggle state from database: openai_enabled=%s", self._openai_enabled)
+            self._logger.info(
+                "Loaded toggle state from database: ai_bg_fallback_mode=%s (manual=%s, effective=%s)",
+                manual_fallback_mode,
+                manual_fallback_mode,
+                self._ai_bg_fallback_mode,
+            )
             self._logger.info("Loaded toggle state from database: music_detection_enabled=%s", self._music_detection_enabled)
             self._logger.info(
                 "Loaded display orientation=%s, portrait_rotate=%s, landscape_rotate=%s",

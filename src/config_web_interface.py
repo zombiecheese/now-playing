@@ -1,8 +1,11 @@
 import argparse
+import base64
+import binascii
 import json
 import mimetypes
 import re
 import shutil
+import subprocess
 import time
 from collections import deque
 from datetime import datetime
@@ -14,14 +17,206 @@ from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlsplit
 
 from PIL import Image
-from spotipy.oauth2 import SpotifyOAuth
+import requests
 
-from settings_store import SettingsStore, SpotifyDbCacheHandler
+from settings_store import SettingsStore
+from service.ai_background_service import AIBackgroundService
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SETTINGS_STORE = SettingsStore()
 MASKED_SECRET_VALUE = "********"
+FALLBACK_UPLOAD_DIR = PROJECT_ROOT / "config" / "fallback_uploads"
+TEST_AI_PREVIEW_PATH = PROJECT_ROOT / "config" / "test_ai_preview.png"
+ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+FALLBACK_TARGET_TO_CONFIG_KEY = {
+  "fallback_day_portrait": "fallback_image_path_day_portrait",
+  "fallback_night_portrait": "fallback_image_path_night_portrait",
+  "fallback_day_landscape": "fallback_image_path_day_landscape",
+  "fallback_night_landscape": "fallback_image_path_night_landscape",
+}
+
+
+def _sanitize_upload_stem(filename: str, default: str = "fallback") -> str:
+  stem = Path(filename or "").stem.strip().lower()
+  if not stem:
+    return default
+  cleaned = re.sub(r"[^a-z0-9_-]+", "-", stem).strip("-")
+  return cleaned or default
+
+
+def _resolve_upload_extension(filename: str) -> str:
+  suffix = Path(filename or "").suffix.lower()
+  if suffix in ALLOWED_IMAGE_EXTENSIONS:
+    return suffix
+  return ".png"
+
+
+def _save_uploaded_fallback_image(target: str, filename: str, content_base64: str) -> str:
+  if target not in {
+    "fallback_legacy",
+    "fallback_day_portrait",
+    "fallback_night_portrait",
+    "fallback_day_landscape",
+    "fallback_night_landscape",
+  }:
+    raise ValueError("Unsupported upload target")
+
+  if not isinstance(content_base64, str) or not content_base64.strip():
+    raise ValueError("Missing upload content")
+
+  try:
+    raw = base64.b64decode(content_base64, validate=True)
+  except (binascii.Error, ValueError) as exc:
+    raise ValueError("Upload content is not valid base64") from exc
+
+  if len(raw) > 15 * 1024 * 1024:
+    raise ValueError("Upload exceeds 15 MB limit")
+
+  try:
+    with Image.open(BytesIO(raw)) as img:
+      img.verify()
+  except Exception as exc:
+    raise ValueError("Uploaded file is not a valid image") from exc
+
+  FALLBACK_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+  stem = _sanitize_upload_stem(filename, default="fallback")
+  ext = _resolve_upload_extension(filename)
+  timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+  save_name = f"{target}_{timestamp}_{stem}{ext}"
+  save_path = FALLBACK_UPLOAD_DIR / save_name
+  save_path.write_bytes(raw)
+  return save_path.relative_to(PROJECT_ROOT).as_posix()
+
+
+def _resolve_project_relative_path(configured_path: str) -> Path:
+  path_value = Path(str(configured_path))
+  if path_value.is_absolute():
+    return path_value
+  return (PROJECT_ROOT / path_value).resolve()
+
+
+def _resolve_current_generated_image(config: Dict[str, Any]) -> Path:
+  # Prefer the rendered preview file because it reflects the current image selected by runtime logic.
+  preview_path = resolve_rendered_preview_path(config)
+  if preview_path.exists() and preview_path.is_file():
+    return preview_path
+
+  display_cfg = config.get("display", {}) if isinstance(config.get("display", {}), dict) else {}
+  configured = str(display_cfg.get("weather_background_image", "") or "").strip()
+  if configured:
+    configured_path = _resolve_project_relative_path(configured)
+    if configured_path.exists() and configured_path.is_file():
+      return configured_path
+
+  toggle_state = load_toggle_state()
+  selected_path = resolve_current_image(config, toggle_state)
+  if selected_path.exists() and selected_path.is_file():
+    return selected_path
+
+  raise ValueError("Current generated image path is empty. Generate an AI image first.")
+
+
+def _save_current_generated_image_as_fallback(target: str, config: Dict[str, Any]) -> str:
+  if target not in FALLBACK_TARGET_TO_CONFIG_KEY:
+    raise ValueError("Unsupported fallback target.")
+
+  source_path = _resolve_current_generated_image(config)
+  if not source_path.exists() or not source_path.is_file():
+    raise FileNotFoundError(f"Current generated image does not exist: {source_path}")
+
+  try:
+    with Image.open(source_path) as img:
+      img.verify()
+  except Exception as exc:
+    raise ValueError("Current generated image is not a valid image file.") from exc
+
+  FALLBACK_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+  stem = _sanitize_upload_stem(source_path.name, default="generated")
+  ext = source_path.suffix.lower() if source_path.suffix.lower() in ALLOWED_IMAGE_EXTENSIONS else ".png"
+  timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+  save_name = f"{target}_{timestamp}_{stem}{ext}"
+  save_path = FALLBACK_UPLOAD_DIR / save_name
+  shutil.copyfile(source_path, save_path)
+  return save_path.relative_to(PROJECT_ROOT).as_posix()
+
+
+def _extract_validation_error(response: requests.Response, fallback: str) -> str:
+  try:
+    payload = response.json()
+  except ValueError:
+    return fallback
+
+  if isinstance(payload, dict):
+    error_value = payload.get("error")
+    if isinstance(error_value, dict):
+      message = error_value.get("message") or error_value.get("type") or error_value.get("code")
+      if isinstance(message, str) and message.strip():
+        return message.strip()
+    if isinstance(error_value, str) and error_value.strip():
+      return error_value.strip()
+
+    message = payload.get("message") or payload.get("error_description") or payload.get("detail")
+    if isinstance(message, str) and message.strip():
+      return message.strip()
+
+  return fallback
+
+
+def _validate_openai_api_key(api_key: str) -> tuple[bool, str]:
+  try:
+    response = requests.get(
+      "https://api.openai.com/v1/models",
+      headers={"Authorization": f"Bearer {api_key}"},
+      timeout=5,
+    )
+  except requests.RequestException as exc:
+    return False, f"OpenAI request failed: {exc}"
+
+  if response.status_code == 200:
+    return True, "OpenAI key accepted"
+
+  return False, _extract_validation_error(response, f"OpenAI returned HTTP {response.status_code}")
+
+
+def _validate_openweather_api_key(api_key: str) -> tuple[bool, str]:
+  try:
+    response = requests.get(
+      "https://api.openweathermap.org/data/2.5/weather",
+      params={"lat": "0", "lon": "0", "units": "metric", "appid": api_key},
+      timeout=5,
+    )
+  except requests.RequestException as exc:
+    return False, f"OpenWeather request failed: {exc}"
+
+  if response.status_code == 200:
+    return True, "OpenWeather key accepted"
+
+  return False, _extract_validation_error(response, f"OpenWeather returned HTTP {response.status_code}")
+
+
+def _validate_pixazo_api_key(api_key: str) -> tuple[bool, str]:
+  if not api_key:
+    return False, "Pixazo API key is required"
+
+  try:
+    response = requests.post(
+      "https://gateway.pixazo.ai/flux-1-schnell/v1/getData",
+      headers={
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        "Ocp-Apim-Subscription-Key": api_key,
+      },
+      json={},
+      timeout=10,
+    )
+  except requests.RequestException as exc:
+    return False, f"Pixazo request failed: {exc}"
+
+  if response.status_code in (200, 400):
+    return True, "Pixazo key accepted"
+
+  return False, _extract_validation_error(response, f"Pixazo returned HTTP {response.status_code}")
 
 
 HTML_PAGE = """<!doctype html>
@@ -81,6 +276,38 @@ HTML_PAGE = """<!doctype html>
       color: #fefefe;
       font-size: 1.05rem;
       letter-spacing: 0.02em;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .card h2 .title-text {
+      flex: 1;
+    }
+
+    .card h2 .title-buttons {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .card h2 button {
+      padding: 6px 10px;
+      font-size: 12px;
+      background: rgba(255, 255, 255, 0.2);
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      color: white;
+      font-weight: 600;
+    }
+
+    .card h2 button:hover {
+      background: rgba(255, 255, 255, 0.3);
+    }
+
+    .card h2 button.secondary {
+      background: rgba(255, 255, 255, 0.15);
     }
 
     .card .content { padding: 14px 16px; }
@@ -225,6 +452,77 @@ HTML_PAGE = """<!doctype html>
       word-break: break-word;
     }
 
+    .field-with-validation .input-with-validation {
+      position: relative;
+      display: flex;
+      align-items: center;
+      width: 100%;
+    }
+
+    .field-with-validation .input-with-validation input {
+      padding-right: 40px;
+    }
+
+    .validation-indicator {
+      position: absolute;
+      right: 12px;
+      top: 50%;
+      transform: translateY(-50%);
+      font-size: 16px;
+      font-weight: 700;
+      min-width: 20px;
+      text-align: center;
+      line-height: 1;
+      pointer-events: none;
+    }
+
+    .validation-indicator.pending {
+      color: #6b675f;
+      font-size: 14px;
+      animation: spin 1s linear infinite;
+    }
+
+    .validation-indicator.valid {
+      color: var(--ok);
+    }
+
+    .validation-indicator.invalid {
+      color: var(--err);
+    }
+
+    .validation-actions {
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 6px;
+    }
+
+    .field-upload {
+      margin-top: 6px;
+      display: flex;
+      justify-content: flex-end;
+    }
+
+    .field-upload .secondary {
+      font-size: 11px;
+      padding: 6px 10px;
+      border-radius: 8px;
+    }
+
+    .hidden-file-input {
+      display: none;
+    }
+
+    .validation-test-btn {
+      font-size: 11px;
+      padding: 6px 10px;
+      border-radius: 8px;
+    }
+
+    @keyframes spin {
+      from { transform: translateY(-50%) rotate(0deg); }
+      to { transform: translateY(-50%) rotate(360deg); }
+    }
+
     .image-box {
       margin-top: 10px;
       border: 1px dashed #9a9488;
@@ -308,6 +606,17 @@ HTML_PAGE = """<!doctype html>
 
     .debug-audio-row:last-child { border-bottom: 0; }
 
+    .debug-audio-actions {
+      display: flex;
+      gap: 6px;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+    }
+
+    .debug-audio-delete-btn {
+      background: #b91c1c;
+    }
+
     .debug-audio-name {
       font-weight: 600;
       word-break: break-all;
@@ -333,18 +642,32 @@ HTML_PAGE = """<!doctype html>
 <body>
   <div class="wrap">
     <section class="card">
-      <h2>Configuration Options</h2>
+      <h2>
+        <span class="title-text">Configuration Options</span>
+        <div class="title-buttons">
+          <button id="saveOptionsBtn">Save Options</button>
+          <button class="secondary" id="reloadBtn">Reload</button>
+        </div>
+      </h2>
       <div class="content">
         <div class="section-title">General</div>
         <div class="grid">
           <div class="field"><label>Web Host</label><input id="webHost" /></div>
           <div class="field"><label>Web Port</label><input id="webPort" type="number" min="1" max="65535" /></div>
-          <div class="field"><label>Admin API Token (leave blank to keep current)</label><input id="webAdminToken" type="password" /></div>
+          <div class="field field-with-validation"><label>Admin API Token (leave blank to keep current)</label><div class="input-with-validation"><input id="webAdminToken" type="password" /><div class="validation-indicator" id="webAdminTokenValidation"></div></div></div>
         </div>
 
         <label class="checkbox-row"><input id="webEnabled" type="checkbox" /> Enable web interface</label>
         <label class="checkbox-row"><input id="musicDetectionEnabled" type="checkbox" /> Enable music detection and lookup</label>
-        <label class="checkbox-row"><input id="openaiEnabled" type="checkbox" /> Enable OpenAI background generation</label>
+        <label class="checkbox-row"><input id="openaiEnabled" type="checkbox" /> Enable AI image generation</label>
+
+        <div id="aiDotMarginSettings" class="subsection hidden">
+          <div class="section-title">AI Disabled Indicator Dot</div>
+          <div class="grid">
+            <div class="field"><label>AI Dot Margin X Px</label><input id="aiDotMarginXPx" type="number" min="0" /></div>
+            <div class="field"><label>AI Dot Margin Y Px</label><input id="aiDotMarginYPx" type="number" min="0" /></div>
+          </div>
+        </div>
 
         <div class="section-title">Audio</div>
         <div class="grid">
@@ -354,24 +677,50 @@ HTML_PAGE = """<!doctype html>
 
         <label class="checkbox-row"><input id="debugAudioEnabled" type="checkbox" /> Enable debug audio capture</label>
 
-        <div id="openaiSectionTitle" class="section-title hidden">OpenAI</div>
+        <div id="debugAudioSettings" class="hidden">
+          <div class="section-title">Debug Audio</div>
+          <div class="grid">
+            <div class="field"><label>Debug Audio Path</label><input id="debugAudioPath" /></div>
+          </div>
+          <div class="row">
+            <button id="refreshDebugAudioBtn" type="button">Refresh Debug Audio</button>
+            <button id="deleteAllDebugAudioBtn" type="button" class="debug-audio-delete-btn">Delete All Debug Audio</button>
+          </div>
+          <div id="debugAudioMeta" class="debug-audio-meta">Debug audio list unavailable.</div>
+          <div id="debugAudioList" class="debug-audio-list"></div>
+          <audio id="debugAudioPlayer" class="debug-audio-player" controls preload="none"></audio>
+        </div>
+
+        <div id="openaiSectionTitle" class="section-title hidden">AI Image Generation</div>
         <div id="openaiSettings" class="hidden">
           <div class="subsection">
-            <div class="section-title">Generation</div>
+            <div class="section-title">Provider</div>
             <div class="grid">
-              <div class="field"><label>OpenAI Model</label><input id="openaiModel" /></div>
-              <div class="field"><label>OpenAI Prompt Style</label><input id="openaiPromptStyle" /></div>
-              <div class="field"><label>OpenAI API Key (leave blank to keep current)</label><input id="openaiApiKey" type="password" /></div>
+              <div class="field"><label>Image Provider</label><select id="aiProvider"><option value="openai">OpenAI</option><option value="pixazo">Pixazo (Free Tier)</option></select></div>
+              <div class="field"><label>Prompt Style</label><input id="openaiPromptStyle" /></div>
             </div>
           </div>
+          <div id="openaiProviderSettings" class="subsection">
+            <div class="section-title">OpenAI Settings</div>
+            <div class="grid">
+              <div class="field"><label>OpenAI Model</label><input id="openaiModel" /></div>
+              <div class="field field-with-validation"><label>OpenAI API Key (leave blank to keep current)</label><div class="input-with-validation"><input id="openaiApiKey" type="password" /><div class="validation-indicator" id="openaiApiKeyValidation"></div></div><div class="validation-actions"><button type="button" class="secondary validation-test-btn" id="testOpenaiKeyBtn">Test OpenAI Credentials</button></div></div>
+            </div>
+          </div>
+          <div id="pixazoProviderSettings" class="subsection hidden">
+            <div class="section-title">Pixazo Free Tier</div>
+            <div class="grid">
+              <div class="field"><label>Pixazo Free Model</label><select id="pixazoModel"><option value="flux-schnell">Flux 1 Schnell (Free)</option></select></div>
+              <div class="field field-with-validation"><label>Pixazo API Key (leave blank to keep current)</label><div class="input-with-validation"><input id="pixazoApiKey" type="password" /><div class="validation-indicator" id="pixazoApiKeyValidation"></div></div><div class="validation-actions"><button type="button" class="secondary validation-test-btn" id="testPixazoKeyBtn">Test Pixazo Credentials</button></div></div>
+            </div>
+            <div class="meta">Pixazo uses its free Flux 1 Schnell endpoint here. The same provider selection is used for real runtime generation and test-image generation.</div>
+          </div>
           <div class="subsection">
-            <div class="section-title">Weather & AI Dot</div>
+            <div class="section-title">Weather</div>
             <div class="grid">
               <div class="field"><label>Weather Refresh Seconds</label><input id="weatherRefresh" type="number" min="60" /></div>
               <div class="field"><label>Timezone</label><input id="weatherTimezone" /></div>
               <div class="field"><label>Weather Background Image</label><input id="weatherBg" /></div>
-              <div class="field"><label>AI Dot Margin X Px</label><input id="aiDotMarginXPx" type="number" min="0" /></div>
-              <div class="field"><label>AI Dot Margin Y Px</label><input id="aiDotMarginYPx" type="number" min="0" /></div>
             </div>
           </div>
           <div class="subsection">
@@ -382,17 +731,17 @@ HTML_PAGE = """<!doctype html>
               <div class="field"><label>Night Lighting</label><textarea id="lightingNight"></textarea></div>
             </div>
           </div>
-        </div>
-
-        <div id="debugAudioSettings" class="hidden">
-          <div class="section-title">Debug Audio</div>
-          <div class="grid">
-            <div class="field"><label>Debug Audio Path</label><input id="debugAudioPath" /></div>
+          <div class="subsection">
+            <div class="section-title">Prompt Preview</div>
+            <div class="row"><button type="button" class="secondary" id="previewPromptBtn">Preview Current Prompt</button></div>
+            <textarea id="promptPreview" class="meta" rows="5" readonly style="width:100%;margin-top:8px;resize:vertical;"></textarea>
           </div>
-          <div class="row"><button id="refreshDebugAudioBtn" type="button">Refresh Debug Audio</button></div>
-          <div id="debugAudioMeta" class="debug-audio-meta">Debug audio list unavailable.</div>
-          <div id="debugAudioList" class="debug-audio-list"></div>
-          <audio id="debugAudioPlayer" class="debug-audio-player" controls preload="none"></audio>
+          <div class="subsection">
+            <div class="section-title">Test Image Preview</div>
+            <div class="row"><button type="button" class="secondary" id="testAiImageBtn">Generate Test Image</button></div>
+            <div id="aiTestImageMeta" class="meta" style="margin-top:8px;">No test image generated yet.</div>
+            <div id="aiTestImageBox" class="image-box"><div class="placeholder">Generate a test image to preview it here.</div></div>
+          </div>
         </div>
 
         <div class="section-title">Display & Image</div>
@@ -405,7 +754,11 @@ HTML_PAGE = """<!doctype html>
           <div class="field"><label>Font Size Subtitle</label><input id="fontSizeSubtitle" type="number" min="1" /></div>
           <div class="field"><label>Orientation Strategy</label><select id="orientationStrategy"><option value="cover">cover</option><option value="contain">contain</option></select></div>
           <div class="field"><label>Max Square Size</label><input id="maxSquareSize" type="number" min="1" /></div>
-          <div class="field"><label>Legacy Fallback Image</label><input id="fallbackImagePath" /></div>
+          <div class="field"><label>Legacy Fallback Image</label><input id="fallbackImagePath" /><div class="field-upload"><button type="button" class="secondary" id="uploadFallbackImageBtn">Upload</button></div></div>
+          <div class="field orientation-portrait-only"><label>Fallback Day Portrait</label><input id="fallbackDayPortrait" /><div class="field-upload"><button type="button" class="secondary" id="uploadFallbackDayPortraitBtn">Upload</button><button type="button" class="secondary ai-enabled-only" id="setFallbackDayPortraitFromCurrentBtn">Use Current Generated</button></div></div>
+          <div class="field orientation-portrait-only"><label>Fallback Night Portrait</label><input id="fallbackNightPortrait" /><div class="field-upload"><button type="button" class="secondary" id="uploadFallbackNightPortraitBtn">Upload</button><button type="button" class="secondary ai-enabled-only" id="setFallbackNightPortraitFromCurrentBtn">Use Current Generated</button></div></div>
+          <div class="field orientation-landscape-only"><label>Fallback Day Landscape</label><input id="fallbackDayLandscape" /><div class="field-upload"><button type="button" class="secondary" id="uploadFallbackDayLandscapeBtn">Upload</button><button type="button" class="secondary ai-enabled-only" id="setFallbackDayLandscapeFromCurrentBtn">Use Current Generated</button></div></div>
+          <div class="field orientation-landscape-only"><label>Fallback Night Landscape</label><input id="fallbackNightLandscape" /><div class="field-upload"><button type="button" class="secondary" id="uploadFallbackNightLandscapeBtn">Upload</button><button type="button" class="secondary ai-enabled-only" id="setFallbackNightLandscapeFromCurrentBtn">Use Current Generated</button></div></div>
           <div class="field"><label>Portrait Album Background Color</label><input id="portraitAlbumBackgroundColor" /></div>
           <div class="field"><label>Small Album Cover Px</label><input id="smallAlbumCoverPx" type="number" min="1" /></div>
           <div class="field"><label>Text Wrap Break Long Words</label><select id="textWrapBreakLongWords"><option value="true">true</option><option value="false">false</option></select></div>
@@ -437,8 +790,6 @@ HTML_PAGE = """<!doctype html>
             <div class="field"><label>Album Offset Right Px</label><input id="portraitAlbumOffsetRightPx" type="number" /></div>
             <div class="field"><label>Album Offset Top Px</label><input id="portraitAlbumOffsetTopPx" type="number" /></div>
             <div class="field"><label>Album Offset Bottom Px</label><input id="portraitAlbumOffsetBottomPx" type="number" /></div>
-            <div class="field"><label>Fallback Day Portrait</label><input id="fallbackDayPortrait" /></div>
-            <div class="field"><label>Fallback Night Portrait</label><input id="fallbackNightPortrait" /></div>
           </div>
         </div>
 
@@ -455,26 +806,13 @@ HTML_PAGE = """<!doctype html>
             <div class="field"><label>Album Offset Right Px</label><input id="landscapeAlbumOffsetRightPx" type="number" /></div>
             <div class="field"><label>Album Offset Top Px</label><input id="landscapeAlbumOffsetTopPx" type="number" /></div>
             <div class="field"><label>Album Offset Bottom Px</label><input id="landscapeAlbumOffsetBottomPx" type="number" /></div>
-            <div class="field"><label>Fallback Day Landscape</label><input id="fallbackDayLandscape" /></div>
-            <div class="field"><label>Fallback Night Landscape</label><input id="fallbackNightLandscape" /></div>
           </div>
         </div>
 
         <div class="section-title">Weather & Integrations</div>
         <div class="grid">
-          <div class="field"><label>OpenWeather API Key</label><input id="weatherApiKey" type="password" /></div>
+          <div class="field field-with-validation"><label>OpenWeather API Key</label><div class="input-with-validation"><input id="weatherApiKey" type="password" /><div class="validation-indicator" id="weatherApiKeyValidation"></div></div><div class="validation-actions"><button type="button" class="secondary validation-test-btn" id="testWeatherKeyBtn">Test OpenWeather Credentials</button></div></div>
           <div class="field"><label>Geo Coordinates</label><input id="geoCoordinates" /></div>
-          <div class="field"><label>Spotify Client ID</label><input id="spotifyClientId" /></div>
-          <div class="field"><label>Spotify Client Secret</label><input id="spotifyClientSecret" type="password" /></div>
-        </div>
-
-        <div class="subsection">
-          <div class="section-title">Spotify Authorization</div>
-          <div class="row">
-            <button type="button" id="spotifyAuthStartBtn">Open Spotify Login</button>
-            <button type="button" class="secondary" id="spotifyAuthStatusBtn">Refresh Spotify Status</button>
-          </div>
-          <div id="spotifyAuthStatus" class="meta">Loading Spotify authorization status...</div>
         </div>
 
         <div class="section-title">Processing & Logs</div>
@@ -485,10 +823,13 @@ HTML_PAGE = """<!doctype html>
           <div class="field"><label>Log File Path</label><input id="logFilePath" /></div>
         </div>
 
+        <div class="section-title">App Service</div>
         <div class="row">
-          <button id="saveOptionsBtn">Save Options</button>
-          <button class="secondary" id="reloadBtn">Reload</button>
+          <button class="secondary" id="refreshAppStatusBtn" type="button">Refresh App Status</button>
+          <button class="secondary" id="restartAppBtn" type="button">Restart App</button>
         </div>
+        <div id="appServiceMeta" class="meta">Loading app service status...</div>
+
         <div id="status" class="status"></div>
       </div>
     </section>
@@ -505,7 +846,10 @@ HTML_PAGE = """<!doctype html>
     <section class="card card-wide">
       <h2>Event Log</h2>
       <div class="content">
-        <div class="row"><button id="refreshEventsBtn">Refresh Events</button></div>
+        <div class="row">
+          <button id="refreshEventsBtn">Refresh Events</button>
+          <button id="clearEventsBtn" class="debug-audio-delete-btn">Clear Events</button>
+        </div>
         <div id="eventMeta" class="event-meta">Loading events...</div>
         <div id="eventLog" class="event-log"></div>
       </div>
@@ -520,14 +864,22 @@ HTML_PAGE = """<!doctype html>
     </section>
   </div>
 
+  <input type="file" id="uploadFallbackImageFile" class="hidden-file-input" accept="image/png,image/jpeg,image/webp,image/bmp" />
+  <input type="file" id="uploadFallbackDayPortraitFile" class="hidden-file-input" accept="image/png,image/jpeg,image/webp,image/bmp" />
+  <input type="file" id="uploadFallbackNightPortraitFile" class="hidden-file-input" accept="image/png,image/jpeg,image/webp,image/bmp" />
+  <input type="file" id="uploadFallbackDayLandscapeFile" class="hidden-file-input" accept="image/png,image/jpeg,image/webp,image/bmp" />
+  <input type="file" id="uploadFallbackNightLandscapeFile" class="hidden-file-input" accept="image/png,image/jpeg,image/webp,image/bmp" />
+
   <script>
     const statusEl = document.getElementById("status");
     const metaEl = document.getElementById("meta");
     const imageBox = document.getElementById("imageBox");
     const eventMetaEl = document.getElementById("eventMeta");
     const eventLogEl = document.getElementById("eventLog");
-    const spotifyAuthStatusEl = document.getElementById("spotifyAuthStatus");
     const cacheStatsEl = document.getElementById("cacheStats");
+    const appServiceMetaEl = document.getElementById("appServiceMeta");
+    const aiTestImageMetaEl = document.getElementById("aiTestImageMeta");
+    const aiTestImageBoxEl = document.getElementById("aiTestImageBox");
     const debugAudioMetaEl = document.getElementById("debugAudioMeta");
     const debugAudioListEl = document.getElementById("debugAudioList");
     const debugAudioPlayerEl = document.getElementById("debugAudioPlayer");
@@ -568,6 +920,9 @@ HTML_PAGE = """<!doctype html>
       openaiModel: document.getElementById("openaiModel"),
       openaiPromptStyle: document.getElementById("openaiPromptStyle"),
       openaiApiKey: document.getElementById("openaiApiKey"),
+      aiProvider: document.getElementById("aiProvider"),
+      pixazoModel: document.getElementById("pixazoModel"),
+      pixazoApiKey: document.getElementById("pixazoApiKey"),
       selectedOrientation: document.getElementById("selectedOrientation"),
       portraitAlign: document.getElementById("portraitAlign"),
       landscapeAlign: document.getElementById("landscapeAlign"),
@@ -595,8 +950,6 @@ HTML_PAGE = """<!doctype html>
       fallbackNightLandscape: document.getElementById("fallbackNightLandscape"),
       weatherApiKey: document.getElementById("weatherApiKey"),
       geoCoordinates: document.getElementById("geoCoordinates"),
-      spotifyClientId: document.getElementById("spotifyClientId"),
-      spotifyClientSecret: document.getElementById("spotifyClientSecret"),
       debounceSeconds: document.getElementById("debounceSeconds"),
       cacheTtlSeconds: document.getElementById("cacheTtlSeconds"),
       cacheSize: document.getElementById("cacheSize"),
@@ -608,6 +961,7 @@ HTML_PAGE = """<!doctype html>
 
     const openaiSettings = document.getElementById("openaiSettings");
     const openaiSectionTitle = document.getElementById("openaiSectionTitle");
+    const aiDotMarginSettings = document.getElementById("aiDotMarginSettings");
     const debugAudioSettings = document.getElementById("debugAudioSettings");
     const portraitSettings = document.getElementById("portraitSettings");
     const landscapeSettings = document.getElementById("landscapeSettings");
@@ -617,6 +971,7 @@ HTML_PAGE = """<!doctype html>
     let activateTabFn = null;
     let portalToken = "";
     let eventSource = null;
+    let restartInFlight = false;
 
     try {
       portalToken = window.localStorage.getItem("nowPlayingAdminToken") || "";
@@ -695,10 +1050,66 @@ HTML_PAGE = """<!doctype html>
         openaiTabPanel.classList.add("hidden");
       }
 
+      if (aiDotMarginSettings) {
+        aiDotMarginSettings.classList.toggle("hidden", openaiEnabled);
+      }
+      document.querySelectorAll(".ai-enabled-only").forEach((el) => {
+        el.classList.toggle("hidden", !openaiEnabled);
+      });
+
       debugAudioSettings.classList.toggle("hidden", !fields.debugAudioEnabled.checked);
       const orientation = fields.selectedOrientation.value || "portrait";
       portraitSettings.classList.toggle("hidden", orientation !== "portrait");
       landscapeSettings.classList.toggle("hidden", orientation !== "landscape");
+      document.querySelectorAll(".orientation-portrait-only").forEach((el) => {
+        el.classList.toggle("hidden", orientation !== "portrait");
+      });
+      document.querySelectorAll(".orientation-landscape-only").forEach((el) => {
+        el.classList.toggle("hidden", orientation !== "landscape");
+      });
+
+      const aiProvider = fields.aiProvider ? fields.aiProvider.value : "openai";
+      const openaiProviderSettingsEl = document.getElementById("openaiProviderSettings");
+      const pixazoProviderSettingsEl = document.getElementById("pixazoProviderSettings");
+      if (openaiProviderSettingsEl) openaiProviderSettingsEl.classList.toggle("hidden", aiProvider !== "openai");
+      if (pixazoProviderSettingsEl) pixazoProviderSettingsEl.classList.toggle("hidden", aiProvider !== "pixazo");
+    }
+
+    function renderAiTestImage(imageUrl, metaText) {
+      if (aiTestImageMetaEl) {
+        aiTestImageMetaEl.textContent = metaText || "";
+      }
+      if (!aiTestImageBoxEl) {
+        return;
+      }
+      if (!imageUrl) {
+        aiTestImageBoxEl.innerHTML = '<div class="placeholder">No test image available.</div>';
+        return;
+      }
+      aiTestImageBoxEl.innerHTML = '<img alt="AI test image preview" src="' + imageUrl + '" />';
+    }
+
+    function buildApiErrorMessage(data, fallbackMessage) {
+      if (!data || typeof data !== "object") {
+        return fallbackMessage;
+      }
+      const parts = [];
+      if (data.error) {
+        parts.push(String(data.error));
+      }
+      if (data.reason) {
+        parts.push(`Reason: ${data.reason}`);
+      }
+      if (data.hint) {
+        parts.push(`Hint: ${data.hint}`);
+      }
+      if (data.provider) {
+        parts.push(`Provider: ${data.provider}`);
+      }
+      if (data.error_type) {
+        parts.push(`Type: ${data.error_type}`);
+      }
+      return parts.length ? parts.join(" ") : fallbackMessage;
     }
 
     function boolFromSelect(value) {
@@ -714,7 +1125,7 @@ HTML_PAGE = """<!doctype html>
       const sectionDefs = [
         { key: "general", title: "General" },
         { key: "audio", title: "Audio" },
-        { key: "openai", title: "OpenAI" },
+        { key: "openai", title: "AI Image Generation" },
         { key: "display", title: "Display & Image" },
         { key: "orientation", title: "Orientation-Specific" },
         { key: "weather", title: "Weather & Integrations" },
@@ -836,6 +1247,9 @@ HTML_PAGE = """<!doctype html>
       fields.openaiModel.value = data.openai_model || "";
       fields.openaiPromptStyle.value = data.openai_prompt_style || "";
       fields.openaiApiKey.value = data.openai_api_key_configured ? MASKED_SECRET_VALUE : "";
+      if (fields.aiProvider) fields.aiProvider.value = data.ai_provider || "openai";
+      if (fields.pixazoModel) fields.pixazoModel.value = data.pixazo_model || "flux-schnell";
+      if (fields.pixazoApiKey) fields.pixazoApiKey.value = data.pixazo_api_key_configured ? MASKED_SECRET_VALUE : "";
       fields.selectedOrientation.value = data.selected_orientation || "portrait";
       fields.portraitAlign.value = data.text_alignment_portrait || "left";
       fields.landscapeAlign.value = data.text_alignment_landscape || "left";
@@ -863,8 +1277,6 @@ HTML_PAGE = """<!doctype html>
       fields.fallbackNightLandscape.value = data.fallback_night_landscape || "";
       fields.weatherApiKey.value = data.weather_api_key_configured ? MASKED_SECRET_VALUE : "";
       fields.geoCoordinates.value = data.geo_coordinates || "";
-      fields.spotifyClientId.value = data.spotify_client_id || "";
-      fields.spotifyClientSecret.value = data.spotify_client_secret_configured ? MASKED_SECRET_VALUE : "";
       fields.debounceSeconds.value = data.debounce_seconds ?? 30;
       fields.cacheTtlSeconds.value = data.cache_ttl_seconds ?? 86400;
       fields.cacheSize.value = data.cache_size ?? 512;
@@ -883,9 +1295,12 @@ HTML_PAGE = """<!doctype html>
         "Recording Duration Seconds": "How long each microphone capture window is before detection/identify. Example: 5s is responsive; 8-10s can improve recognition in noisy rooms.",
         "Audio Gain (dB)": "Applies digital gain before analysis. Increase if captures are quiet; reduce if clipping/noise increases. Typical range: -5 to +10 dB.",
         "Debug Audio Path": "Folder to save captured debug clips when debug capture is enabled. Example: debug_audio.",
+        "Image Provider": "Choose which provider settings to use for AI image generation. Pixazo is currently limited to intended free-tier model choices.",
         "OpenAI Model": "Image model used for AI background generation. Example: gpt-image-1-mini for lower cost/faster generation.",
-        "OpenAI Prompt Style": "Creative style appended to prompts. Example: moody watercolor cityscape, retro synthwave sunset, minimalist ink wash.",
+        "Prompt Style": "Creative style appended to prompts. Example: moody watercolor cityscape, retro synthwave sunset, minimalist ink wash.",
         "OpenAI API Key (leave blank to keep current)": "Secret key for OpenAI requests. Leave as ******** to keep current value, or paste a new key to rotate.",
+        "Pixazo Free Model": "Select from the intended free-tier Pixazo model options.",
+        "Pixazo API Key (leave blank to keep current)": "Pixazo subscription key sent as Ocp-Apim-Subscription-Key. Leave as ******** to keep the current value.",
         "Weather Refresh Seconds": "How often weather context and AI background refresh logic run. Example: 3600 = once per hour.",
         "Timezone": "Timezone used for day/twilight/night decisions. Example: Australia/Melbourne or Europe/London.",
         "Weather Background Image": "Path to the fallback/active weather background image file used when no generated image is selected.",
@@ -911,8 +1326,6 @@ HTML_PAGE = """<!doctype html>
         "Selected Orientation": "Preview/edit mode for orientation-specific settings. Choose portrait or landscape before adjusting offsets.",
         "OpenWeather API Key": "API key for weather lookups. Leave as ******** to keep current value, or paste a new key.",
         "Geo Coordinates": "Latitude,longitude for weather and lighting context. Example: -37.8136,144.9631.",
-        "Spotify Client ID": "Spotify app client ID for enrichment/auth flows.",
-        "Spotify Client Secret": "Spotify app secret. Leave as ******** to keep current value, or paste a new secret.",
         "Debounce Seconds": "Minimum time between repeated expensive operations to prevent rapid re-triggering.",
         "Cache TTL Seconds": "How long cached enrichment data remains valid. Example: 86400 = 24 hours.",
         "Cache Size": "Maximum number of cached enrichment records before old entries are evicted.",
@@ -925,18 +1338,24 @@ HTML_PAGE = """<!doctype html>
       const checkboxHints = {
         "Enable web interface": "Turns the admin HTTP portal on or off.",
         "Enable music detection and lookup": "Controls whether microphone capture, music detection, and song identification run. Disable to keep screensaver/weather only.",
-        "Enable OpenAI background generation": "Enables AI image generation; when off, the app uses configured static fallback images.",
+        "Enable AI image generation": "Enables AI image generation; when off, the app uses configured static fallback images.",
         "Enable debug audio capture": "Saves captured audio clips for troubleshooting detection/identify behavior.",
       };
 
       const buttonHints = {
         "Save Options": "Persists all current settings to the database.",
         "Reload": "Re-reads settings from the database and refreshes the form.",
+        "Restart App": "Restarts the main now-playing runtime service without taking down this admin panel.",
+        "Refresh App Status": "Queries the main now-playing service state from systemd.",
+        "Upload": "Uploads an image file and writes its path into this setting.",
+        "Use Current Generated": "Copies the current generated weather image into this fallback slot and saves it immediately.",
+        "Preview Current Prompt": "Preview the AI image prompt built from the current form values.",
+        "Generate Test Image": "Generate a non-live test image using the current AI settings and preview it below.",
         "Refresh Image State": "Fetches the latest selected/preview image metadata and updates preview pane.",
         "Refresh Events": "Loads recent service log events.",
+        "Clear Events": "Clears the current event log file content.",
         "Refresh Debug Audio": "Loads recent debug audio recordings from the configured debug audio folder.",
-        "Open Spotify Login": "Starts Spotify OAuth in a new tab.",
-        "Refresh Spotify Status": "Checks whether a Spotify token exists and is still valid.",
+        "Delete All Debug Audio": "Deletes all debug recordings from the configured debug audio folder.",
         "Refresh Cache Stats": "Reloads cache/database health statistics.",
       };
 
@@ -1010,12 +1429,242 @@ HTML_PAGE = """<!doctype html>
         .replace(/'/g, "&#39;");
     }
 
+    function readFileAsBase64(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const result = String(reader.result || "");
+          const comma = result.indexOf(",");
+          if (comma < 0) {
+            reject(new Error("Invalid file data"));
+            return;
+          }
+          resolve(result.slice(comma + 1));
+        };
+        reader.onerror = () => reject(reader.error || new Error("Failed to read file"));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    async function uploadFallbackImage(target, fieldKey, file) {
+      if (!file) {
+        return;
+      }
+      if (!String(file.type || "").startsWith("image/")) {
+        setStatus("Upload failed: file must be an image.", false);
+        return;
+      }
+
+      try {
+        setStatus(`Uploading ${file.name}...`, true);
+        const contentBase64 = await readFileAsBase64(file);
+        const res = await apiFetch("/api/upload-fallback-image", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            target,
+            filename: file.name,
+            content_base64: contentBase64,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          setStatus(data.error || "Upload failed.", false);
+          return;
+        }
+
+        if (fields[fieldKey]) {
+          fields[fieldKey].value = data.path || "";
+        }
+        setStatus(data.message || "Upload complete.", true);
+      } catch (error) {
+        setStatus(`Upload failed: ${error}`, false);
+      }
+    }
+
+    async function setCurrentGeneratedAsFallback(target, fieldKey) {
+      try {
+        setStatus("Saving current generated image to fallback...", true);
+        const res = await apiFetch("/api/fallback/use-current-generated", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ target }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          setStatus(buildApiErrorMessage(data, "Failed to set fallback image from current generated image."), false);
+          return;
+        }
+
+        if (fields[fieldKey] && data.path) {
+          fields[fieldKey].value = data.path;
+        }
+        setStatus(data.message || "Fallback image updated from current generated image.", true);
+      } catch (error) {
+        setStatus(`Failed to set fallback image from current generated image: ${error}`, false);
+      }
+    }
+
+    function setupFallbackUploadButtons() {
+      const uploadDefs = [
+        {
+          buttonId: "uploadFallbackImageBtn",
+          inputId: "uploadFallbackImageFile",
+          target: "fallback_legacy",
+          fieldKey: "fallbackImagePath",
+        },
+        {
+          buttonId: "uploadFallbackDayPortraitBtn",
+          inputId: "uploadFallbackDayPortraitFile",
+          target: "fallback_day_portrait",
+          fieldKey: "fallbackDayPortrait",
+        },
+        {
+          buttonId: "uploadFallbackNightPortraitBtn",
+          inputId: "uploadFallbackNightPortraitFile",
+          target: "fallback_night_portrait",
+          fieldKey: "fallbackNightPortrait",
+        },
+        {
+          buttonId: "uploadFallbackDayLandscapeBtn",
+          inputId: "uploadFallbackDayLandscapeFile",
+          target: "fallback_day_landscape",
+          fieldKey: "fallbackDayLandscape",
+        },
+        {
+          buttonId: "uploadFallbackNightLandscapeBtn",
+          inputId: "uploadFallbackNightLandscapeFile",
+          target: "fallback_night_landscape",
+          fieldKey: "fallbackNightLandscape",
+        },
+      ];
+
+      for (const def of uploadDefs) {
+        const button = document.getElementById(def.buttonId);
+        const input = document.getElementById(def.inputId);
+        if (!button || !input) {
+          continue;
+        }
+        button.addEventListener("click", () => {
+          input.value = "";
+          input.click();
+        });
+        input.addEventListener("change", () => {
+          const file = input.files && input.files[0] ? input.files[0] : null;
+          uploadFallbackImage(def.target, def.fieldKey, file);
+        });
+      }
+    }
+
+    function setupUseCurrentGeneratedButtons() {
+      const defs = [
+        {
+          buttonId: "setFallbackDayPortraitFromCurrentBtn",
+          target: "fallback_day_portrait",
+          fieldKey: "fallbackDayPortrait",
+        },
+        {
+          buttonId: "setFallbackNightPortraitFromCurrentBtn",
+          target: "fallback_night_portrait",
+          fieldKey: "fallbackNightPortrait",
+        },
+        {
+          buttonId: "setFallbackDayLandscapeFromCurrentBtn",
+          target: "fallback_day_landscape",
+          fieldKey: "fallbackDayLandscape",
+        },
+        {
+          buttonId: "setFallbackNightLandscapeFromCurrentBtn",
+          target: "fallback_night_landscape",
+          fieldKey: "fallbackNightLandscape",
+        },
+      ];
+
+      for (const def of defs) {
+        const button = document.getElementById(def.buttonId);
+        if (!button) {
+          continue;
+        }
+        button.addEventListener("click", () => {
+          void setCurrentGeneratedAsFallback(def.target, def.fieldKey);
+        });
+      }
+    }
+
     function buildDebugAudioUrl(fileName) {
       const params = new URLSearchParams({ name: fileName });
       if (portalToken) {
         params.set("token", portalToken);
       }
       return '/api/debug-audio/file?' + params.toString();
+    }
+
+    function decodeDebugAudioName(nameAttr) {
+      try {
+        return decodeURIComponent(String(nameAttr || ""));
+      } catch (error) {
+        void error;
+        return String(nameAttr || "");
+      }
+    }
+
+    async function deleteDebugAudioFile(fileName) {
+      if (!fileName) {
+        return;
+      }
+      if (!window.confirm(`Delete debug recording \"${fileName}\"?`)) {
+        return;
+      }
+
+      try {
+        const res = await apiFetch('/api/debug-audio/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: fileName })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          debugAudioMetaEl.textContent = buildApiErrorMessage(data, 'Failed to delete debug recording.');
+          return;
+        }
+
+        const currentSrc = String(debugAudioPlayerEl.src || '');
+        if (currentSrc.includes(encodeURIComponent(fileName))) {
+          debugAudioPlayerEl.removeAttribute('src');
+          debugAudioPlayerEl.load();
+        }
+
+        debugAudioMetaEl.textContent = data.message || `Deleted ${fileName}.`;
+        await loadDebugAudioList();
+      } catch (error) {
+        debugAudioMetaEl.textContent = `Failed to delete debug recording: ${error}`;
+      }
+    }
+
+    async function deleteAllDebugAudioFiles() {
+      if (!window.confirm("Delete all debug recordings? This cannot be undone.")) {
+        return;
+      }
+
+      try {
+        const res = await apiFetch('/api/debug-audio/delete-all', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirm: true })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          debugAudioMetaEl.textContent = buildApiErrorMessage(data, 'Failed to delete all debug recordings.');
+          return;
+        }
+
+        debugAudioPlayerEl.removeAttribute('src');
+        debugAudioPlayerEl.load();
+        debugAudioMetaEl.textContent = data.message || 'Deleted debug recordings.';
+        await loadDebugAudioList();
+      } catch (error) {
+        debugAudioMetaEl.textContent = `Failed to delete all debug recordings: ${error}`;
+      }
     }
 
     function renderDebugAudioList(data) {
@@ -1029,6 +1678,7 @@ HTML_PAGE = """<!doctype html>
 
       debugAudioListEl.innerHTML = rows.map((row) => {
         const fileName = escapeHtml(row.name);
+        const encodedName = encodeURIComponent(String(row.name || ""));
         const size = escapeHtml(formatBytes(row.size_bytes));
         const modified = escapeHtml(row.modified_at || "");
         return (
@@ -1037,7 +1687,10 @@ HTML_PAGE = """<!doctype html>
               '<div class="debug-audio-name">' + fileName + '</div>' +
               '<div class="debug-audio-details">' + size + ' • ' + modified + '</div>' +
             '</div>' +
-            '<button type="button" class="secondary debug-audio-play-btn" data-name="' + fileName + '">Play</button>' +
+            '<div class="debug-audio-actions">' +
+              '<button type="button" class="secondary debug-audio-play-btn" data-name="' + encodedName + '">Play</button>' +
+              '<button type="button" class="debug-audio-delete-btn" data-name="' + encodedName + '">Delete</button>' +
+            '</div>' +
           '</div>'
         );
       }).join('');
@@ -1097,6 +1750,9 @@ HTML_PAGE = """<!doctype html>
         openai_model: fields.openaiModel.value.trim(),
         openai_prompt_style: fields.openaiPromptStyle.value.trim(),
         openai_api_key: fields.openaiApiKey.value,
+        ai_provider: fields.aiProvider ? fields.aiProvider.value : "openai",
+        pixazo_model: fields.pixazoModel ? fields.pixazoModel.value : "flux-schnell",
+        pixazo_api_key: fields.pixazoApiKey ? fields.pixazoApiKey.value : "",
         selected_orientation: fields.selectedOrientation.value,
         text_alignment_portrait: fields.portraitAlign.value,
         text_alignment_landscape: fields.landscapeAlign.value,
@@ -1124,8 +1780,6 @@ HTML_PAGE = """<!doctype html>
         fallback_night_landscape: fields.fallbackNightLandscape.value.trim(),
         weather_api_key: fields.weatherApiKey.value,
         geo_coordinates: fields.geoCoordinates.value.trim(),
-        spotify_client_id: fields.spotifyClientId.value.trim(),
-        spotify_client_secret: fields.spotifyClientSecret.value,
         debounce_seconds: Number(fields.debounceSeconds.value),
         cache_ttl_seconds: Number(fields.cacheTtlSeconds.value),
         cache_size: Number(fields.cacheSize.value),
@@ -1166,7 +1820,6 @@ HTML_PAGE = """<!doctype html>
       await loadImageState();
       await loadEvents();
       await loadCacheStats();
-      await loadSpotifyAuthStatus();
       startEventStream();
     }
 
@@ -1218,56 +1871,135 @@ HTML_PAGE = """<!doctype html>
       renderEvents(data);
     }
 
-    function formatSpotifyAuthStatus(data) {
+    async function clearEvents() {
+      if (!window.confirm('Clear the event log now?')) {
+        return;
+      }
+
+      try {
+        const res = await apiFetch('/api/events/clear', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirm: true })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          eventMetaEl.textContent = buildApiErrorMessage(data, 'Failed to clear event log.');
+          return;
+        }
+
+        eventMetaEl.textContent = data.message || 'Event log cleared.';
+        await loadEvents();
+      } catch (error) {
+        eventMetaEl.textContent = `Failed to clear event log: ${error}`;
+      }
+    }
+
+    async function restartMainApp() {
+      if (!window.confirm('Restart the main now-playing app service now?')) {
+        return;
+      }
+
+      try {
+        restartInFlight = true;
+        const restartBtn = document.getElementById("restartAppBtn");
+        if (restartBtn) {
+          restartBtn.disabled = true;
+        }
+        setStatus('Restarting main app service...', true);
+        const res = await apiFetch('/api/app/restart', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirm: true })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          setStatus(buildApiErrorMessage(data, 'Failed to restart app service.'), false);
+          restartInFlight = false;
+          if (restartBtn) {
+            restartBtn.disabled = false;
+          }
+          return;
+        }
+
+        setStatus(data.message || 'Restart signal sent to main app service.', true);
+        await waitForAppActiveAfterRestart();
+      } catch (error) {
+        setStatus(`Failed to restart app service: ${error}`, false);
+      } finally {
+        restartInFlight = false;
+        const restartBtn = document.getElementById("restartAppBtn");
+        if (restartBtn) {
+          restartBtn.disabled = false;
+        }
+      }
+    }
+
+    function renderAppServiceStatus(data) {
+      if (!appServiceMetaEl) {
+        return;
+      }
+
+      if (!data || typeof data !== 'object') {
+        appServiceMetaEl.textContent = 'App service status unavailable.';
+        return;
+      }
+
       const lines = [];
-      lines.push(`Configured: ${data.configured ? "yes" : "no"}`);
-      lines.push(`Token cached: ${data.has_token ? "yes" : "no"}`);
-      if (data.updated_at) {
-        lines.push(`Updated at: ${data.updated_at}`);
+      lines.push(`Service: now-playing.service`);
+      lines.push(`Active state: ${data.active_state || 'unknown'}`);
+      if (typeof data.ok === 'boolean') {
+        lines.push(`Healthy: ${data.ok ? 'yes' : 'no'}`);
       }
-      if (typeof data.expires_at === "number") {
-        lines.push(`Expires at: ${new Date(data.expires_at * 1000).toLocaleString()}`);
+      if (typeof data.returncode === 'number') {
+        lines.push(`Status command code: ${data.returncode}`);
       }
-      lines.push(`Valid: ${data.is_valid ? "yes" : "no"}`);
-      if (data.redirect_uri) {
-        lines.push(`Redirect URI: ${data.redirect_uri}`);
+      if (data.checked_at) {
+        lines.push(`Checked at: ${data.checked_at}`);
       }
-      return lines.join("\\n");
+      if (data.stderr) {
+        lines.push(`systemctl stderr: ${data.stderr}`);
+      }
+      appServiceMetaEl.textContent = lines.join('\\n');
     }
 
-    async function loadSpotifyAuthStatus() {
+    async function loadAppServiceStatus(silent = false) {
       try {
-        const res = await apiFetch('/api/spotify-auth/status');
+        const res = await apiFetch('/api/app/status');
         const data = await res.json();
         if (!res.ok) {
-          spotifyAuthStatusEl.textContent = data.error || 'Failed to load Spotify auth status.';
-          return;
+          if (!silent) {
+            setStatus(buildApiErrorMessage(data, 'Failed to load app service status.'), false);
+          }
+          renderAppServiceStatus({ active_state: 'unknown', ok: false, stderr: data && data.error ? String(data.error) : '' });
+          return null;
         }
-        spotifyAuthStatusEl.textContent = formatSpotifyAuthStatus(data);
+
+        renderAppServiceStatus(data);
+        if (!silent && !restartInFlight) {
+          setStatus(`App service state: ${data.active_state || 'unknown'}`, !!data.ok);
+        }
+        return data;
       } catch (error) {
-        spotifyAuthStatusEl.textContent = `Failed to load Spotify auth status: ${error}`;
+        if (!silent) {
+          setStatus(`Failed to load app service status: ${error}`, false);
+        }
+        renderAppServiceStatus({ active_state: 'unknown', ok: false, stderr: String(error) });
+        return null;
       }
     }
 
-    async function openSpotifyLogin() {
-      setStatus("Preparing Spotify login...", true);
-      try {
-        const res = await apiFetch('/api/spotify-auth/start');
-        const data = await res.json();
-        if (!res.ok) {
-          setStatus(data.error || 'Failed to create Spotify login URL.', false);
+    async function waitForAppActiveAfterRestart() {
+      const attempts = 60;
+      for (let i = 0; i < attempts; i += 1) {
+        const data = await loadAppServiceStatus(true);
+        if (data && data.ok) {
+          setStatus('App restart complete: service is active.', true);
           return;
         }
-        if (data.authorize_url) {
-          window.open(data.authorize_url, '_blank', 'noopener,noreferrer');
-          setStatus('Spotify login opened in a new tab.', true);
-          await loadSpotifyAuthStatus();
-        } else {
-          setStatus('Spotify login URL was not returned.', false);
-        }
-      } catch (error) {
-        setStatus(`Failed to start Spotify login: ${error}`, false);
+        await new Promise((resolve) => setTimeout(resolve, 1000));
       }
+      setStatus('Restart requested, but app did not report active before timeout.', false);
     }
 
     function formatCacheStats(data) {
@@ -1292,16 +2024,6 @@ HTML_PAGE = """<!doctype html>
       if (weather.fetched_at) {
         lines.push(`Weather fetched at: ${weather.fetched_at}`);
       }
-
-      const spotify = data.spotify_auth_cache || {};
-      lines.push(`Spotify auth token present: ${spotify.present ? "yes" : "no"}`);
-      if (spotify.updated_at) {
-        lines.push(`Spotify token updated at: ${spotify.updated_at}`);
-      }
-      if (typeof spotify.expires_at === "number") {
-        lines.push(`Spotify token expires at: ${new Date(spotify.expires_at * 1000).toLocaleString()}`);
-      }
-      lines.push(`Spotify token valid: ${spotify.is_valid ? "yes" : "no"}`);
 
       return lines.join("\\n");
     }
@@ -1335,8 +2057,69 @@ HTML_PAGE = """<!doctype html>
         cacheStatsEl.textContent = formatCacheStats(snapshot.cache_stats);
       }
 
-      if (snapshot.spotify_auth) {
-        spotifyAuthStatusEl.textContent = formatSpotifyAuthStatus(snapshot.spotify_auth);
+    }
+
+    const validationTimers = {};
+
+    async function validateApiKey(fieldId, indicatorId, validationType, useStoredWhenMasked = false) {
+      const field = document.getElementById(fieldId);
+      const indicator = document.getElementById(indicatorId);
+      if (!field || !indicator) return;
+
+      const value = field.value.trim();
+      if (!value || (value === MASKED_SECRET_VALUE && !useStoredWhenMasked)) {
+        indicator.textContent = '';
+        indicator.className = 'validation-indicator';
+        return;
+      }
+
+      indicator.textContent = '⟳';
+      indicator.className = 'validation-indicator pending';
+
+      try {
+        const res = await apiFetch('/api/validate-key', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            key_type: validationType,
+            key_value: value,
+            use_stored_when_masked: !!useStoredWhenMasked
+          })
+        });
+        const data = await res.json();
+        if (data.valid) {
+          indicator.textContent = '✓';
+          indicator.className = 'validation-indicator valid';
+        } else {
+          indicator.textContent = '✗';
+          indicator.className = 'validation-indicator invalid';
+        }
+      } catch (error) {
+        indicator.textContent = '✗';
+        indicator.className = 'validation-indicator invalid';
+      }
+    }
+
+    function setupValidationListeners() {
+      const validationFields = [
+        { fieldId: 'webAdminToken', indicatorId: 'webAdminTokenValidation', type: 'admin_token' },
+        { fieldId: 'openaiApiKey', indicatorId: 'openaiApiKeyValidation', type: 'openai_key' },
+        { fieldId: 'weatherApiKey', indicatorId: 'weatherApiKeyValidation', type: 'openweather_key' },
+        { fieldId: 'pixazoApiKey', indicatorId: 'pixazoApiKeyValidation', type: 'pixazo_key' }
+      ];
+
+      for (const config of validationFields) {
+        const field = document.getElementById(config.fieldId);
+        if (field) {
+          field.addEventListener('blur', () => {
+            if (validationTimers[config.fieldId]) {
+              clearTimeout(validationTimers[config.fieldId]);
+            }
+            validationTimers[config.fieldId] = setTimeout(() => {
+              validateApiKey(config.fieldId, config.indicatorId, config.type);
+            }, 300);
+          });
+        }
       }
     }
 
@@ -1373,35 +2156,101 @@ HTML_PAGE = """<!doctype html>
       await loadOptions();
       await loadImageState();
       await loadEvents();
+      await loadAppServiceStatus(true);
     });
+    document.getElementById("restartAppBtn").addEventListener("click", restartMainApp);
+    document.getElementById("refreshAppStatusBtn").addEventListener("click", () => loadAppServiceStatus(false));
     document.getElementById("refreshImageBtn").addEventListener("click", loadImageState);
     document.getElementById("refreshEventsBtn").addEventListener("click", loadEvents);
+    document.getElementById("clearEventsBtn").addEventListener("click", clearEvents);
     document.getElementById("refreshDebugAudioBtn").addEventListener("click", loadDebugAudioList);
-    document.getElementById("spotifyAuthStartBtn").addEventListener("click", openSpotifyLogin);
-    document.getElementById("spotifyAuthStatusBtn").addEventListener("click", loadSpotifyAuthStatus);
+    document.getElementById("deleteAllDebugAudioBtn").addEventListener("click", deleteAllDebugAudioFiles);
+    document.getElementById("testOpenaiKeyBtn").addEventListener("click", () => {
+      validateApiKey('openaiApiKey', 'openaiApiKeyValidation', 'openai_key', true);
+    });
+    document.getElementById("testWeatherKeyBtn").addEventListener("click", () => {
+      validateApiKey('weatherApiKey', 'weatherApiKeyValidation', 'openweather_key', true);
+    });
+    document.getElementById("testPixazoKeyBtn").addEventListener("click", () => {
+      validateApiKey('pixazoApiKey', 'pixazoApiKeyValidation', 'pixazo_key', true);
+    });
     document.getElementById("refreshCacheStatsBtn").addEventListener("click", loadCacheStats);
+    setupFallbackUploadButtons();
+    setupUseCurrentGeneratedButtons();
+
+    if (fields.aiProvider) {
+      fields.aiProvider.addEventListener("change", applyVisibilityRules);
+    }
+
+    document.getElementById("previewPromptBtn").addEventListener("click", async () => {
+      const el = document.getElementById("promptPreview");
+      if (!el) return;
+      el.value = "Loading...";
+      try {
+        const res = await apiFetch("/api/preview-prompt", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(collectOptionValues())
+        });
+        const data = await res.json();
+        el.value = res.ok ? (data.prompt || "") : (data.error || "Failed to load preview.");
+      } catch (error) {
+        el.value = `Error: ${error}`;
+      }
+    });
+
+    document.getElementById("testAiImageBtn").addEventListener("click", async () => {
+      renderAiTestImage("", "Generating test image...");
+      try {
+        const res = await apiFetch("/api/test-ai-image", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(collectOptionValues())
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          renderAiTestImage("", buildApiErrorMessage(data, "Failed to generate test image."));
+          return;
+        }
+        const stamp = Date.now();
+        renderAiTestImage('/api/test-ai-image/file?t=' + stamp, data.message || "Test image generated.");
+        const previewEl = document.getElementById("promptPreview");
+        if (previewEl && data.prompt) {
+          previewEl.value = data.prompt;
+        }
+      } catch (error) {
+        renderAiTestImage("", `Failed to generate test image: ${error}`);
+      }
+    });
 
     debugAudioListEl.addEventListener("click", (evt) => {
       const target = evt.target;
-      if (!(target instanceof HTMLElement) || !target.classList.contains("debug-audio-play-btn")) {
+      if (!(target instanceof HTMLElement)) {
         return;
       }
-      const fileName = target.getAttribute("data-name") || "";
+      const fileName = decodeDebugAudioName(target.getAttribute("data-name") || "");
       if (!fileName) {
         return;
       }
-      debugAudioPlayerEl.src = buildDebugAudioUrl(fileName);
-      debugAudioPlayerEl.play().catch(() => {});
+      if (target.classList.contains("debug-audio-play-btn")) {
+        debugAudioPlayerEl.src = buildDebugAudioUrl(fileName);
+        debugAudioPlayerEl.play().catch(() => {});
+        return;
+      }
+      if (target.classList.contains("debug-audio-delete-btn")) {
+        void deleteDebugAudioFile(fileName);
+      }
     });
 
     (async () => {
       setupSectionTabs();
       applyHoverHints();
+      setupValidationListeners();
       await loadOptions();
       await loadImageState();
       await loadEvents();
       await loadDebugAudioList();
-      await loadSpotifyAuthStatus();
+      await loadAppServiceStatus(true);
       await loadCacheStats();
       startEventStream();
     })();
@@ -1417,6 +2266,57 @@ def load_config_data() -> Dict[str, Any]:
 
 def backup_config() -> Path | None:
   return SETTINGS_STORE.backup_database()
+
+
+def _build_preview_prompt_fallback(config: Dict[str, Any]) -> str:
+  openai_cfg = config.get("openai", {}) if isinstance(config.get("openai", {}), dict) else {}
+  weather_cfg = config.get("weather", {}) if isinstance(config.get("weather", {}), dict) else {}
+  lighting_cfg = config.get("lighting", {}) if isinstance(config.get("lighting", {}), dict) else {}
+
+  style_txt = str(openai_cfg.get("prompt_style", "") or "").strip() or "80s anime style"
+  geo = str(weather_cfg.get("geo_coordinates", "") or "").strip()
+
+  hour = datetime.now().hour
+  if 17 <= hour <= 19 or 6 <= hour <= 8:
+    lighting_txt = str(lighting_cfg.get("twilight", "") or "").strip()
+    period = "twilight"
+  elif 7 <= hour <= 19:
+    lighting_txt = str(lighting_cfg.get("day", "") or "").strip()
+    period = "day"
+  else:
+    lighting_txt = str(lighting_cfg.get("night", "") or "").strip()
+    period = "night"
+
+  city = "configured location"
+  if geo:
+    try:
+      lat_str, lon_str = geo.split(",", 1)
+      city = f"location at {lat_str.strip()}, {lon_str.strip()}"
+    except Exception:
+      pass
+
+  return (
+    f"Generate an image in an {style_txt} style of location accurate {city} architecture with no signage. "
+    f"Set the scene at the current time of day ({period}). "
+    f"{lighting_txt} "
+    f"Incorporate the area's local train system and accurate city skyline into the composition "
+    f"and ensure that the major details are cropped within a centered 480px wide area."
+  ).strip()
+
+
+def _build_preview_prompt(config: Dict[str, Any]) -> str:
+  # Keep prompt preview behavior aligned with runtime AI prompt generation logic.
+  try:
+    ai_service = AIBackgroundService(config_override=config, output_override=str(TEST_AI_PREVIEW_PATH))
+    ai_service._prepare_context()
+    return ai_service._build_dynamic_prompt()
+  except Exception:
+    return _build_preview_prompt_fallback(config)
+
+
+def build_preview_config_from_options(options: Dict[str, Any]) -> Dict[str, Any]:
+  config = load_config_data()
+  return apply_config_options(config, options, persist_toggle_updates=False)
 
 
 def load_toggle_state() -> Dict[str, Any]:
@@ -1515,11 +2415,14 @@ def build_current_image_payload(config: Dict[str, Any], toggle: Dict[str, Any]) 
     is_rendered_preview = preview_path.exists()
     image_path = preview_path if is_rendered_preview else resolve_current_image(config, toggle)
     rotate_degrees = resolve_preview_rotation_degrees(config, toggle, is_rendered_preview)
+    openai_enabled = bool(toggle.get("openai_enabled", True))
+    manual_fallback_mode = bool(toggle.get("ai_bg_fallback_mode", False))
+    effective_fallback_mode = (not openai_enabled) or manual_fallback_mode
     return {
       "selected_image_path": str(image_path),
       "image_exists": image_path.exists(),
       "orientation": str(toggle.get("orientation", "portrait")).lower(),
-      "ai_bg_fallback_mode": bool(toggle.get("ai_bg_fallback_mode", False)),
+      "ai_bg_fallback_mode": effective_fallback_mode,
       "daytime_assumption": is_daytime(),
       "is_rendered_preview": is_rendered_preview,
       "preview_rotation_degrees": rotate_degrees,
@@ -1616,6 +2519,39 @@ def resolve_debug_audio_file(config: Dict[str, Any], name: str) -> Path:
     return candidate
 
 
+def delete_debug_audio_file(config: Dict[str, Any], name: str) -> Path:
+    target = resolve_debug_audio_file(config, name)
+    if not target.exists() or not target.is_file():
+        raise FileNotFoundError("Debug audio file not found.")
+    target.unlink()
+    return target
+
+
+def delete_all_debug_audio_files(config: Dict[str, Any]) -> Dict[str, Any]:
+  listing = list_debug_audio_entries(config, limit=2000)
+  rows = listing.get("files") if isinstance(listing, dict) else []
+  if not isinstance(rows, list):
+    rows = []
+
+  deleted = 0
+  failed: list[str] = []
+  for row in rows:
+    name = str((row or {}).get("name", "")).strip() if isinstance(row, dict) else ""
+    if not name:
+      continue
+    try:
+      delete_debug_audio_file(config, name)
+      deleted += 1
+    except Exception:
+      failed.append(name)
+
+  return {
+    "deleted_count": deleted,
+    "failed_count": len(failed),
+    "failed_names": failed,
+  }
+
+
 def classify_event_kind(level: str, message: str) -> str:
     text = f"{(level or '').lower()} {message.lower()}"
     if any(token in text for token in ["fallback", "fallback mode", "used fallback"]):
@@ -1655,6 +2591,55 @@ def read_recent_events(log_path: Path, limit: int) -> list[Dict[str, str]]:
     return [parse_event_line(row) for row in rows if row.strip()]
 
 
+def clear_event_log(config: Dict[str, Any]) -> Dict[str, Any]:
+    log_path = resolve_log_file_path(config)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    cleared_bytes = 0
+    if log_path.exists() and log_path.is_file():
+        try:
+            cleared_bytes = int(log_path.stat().st_size)
+        except Exception:
+            cleared_bytes = 0
+
+    with log_path.open("w", encoding="utf-8"):
+        pass
+
+    return {"log_path": str(log_path), "cleared_bytes": cleared_bytes}
+
+
+def get_main_service_status() -> Dict[str, Any]:
+    command = ["sudo", "-n", "systemctl", "is-active", "now-playing.service"]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    checked_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    return {
+      "active_state": stdout or "unknown",
+      "ok": result.returncode == 0 and stdout == "active",
+      "returncode": result.returncode,
+      "stderr": stderr,
+      "checked_at": checked_at,
+    }
+
+
+def restart_main_service() -> Dict[str, Any]:
+    requested_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    command = ["sudo", "-n", "systemctl", "restart", "now-playing.service"]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0:
+        raise RuntimeError(stderr or "systemctl restart failed")
+
+    status = get_main_service_status()
+    return {
+        "message": "Restart command sent to now-playing.service.",
+        "requested_at": requested_at,
+        "active_state": status.get("active_state", "unknown"),
+        "status_ok": bool(status.get("ok", False)),
+        "checked_at": status.get("checked_at"),
+    }
+
+
 def build_config_options(config: Dict[str, Any]) -> Dict[str, Any]:
     display_cfg = config.get("display", {}) if isinstance(config.get("display", {}), dict) else {}
     weather_cfg = config.get("weather", {}) if isinstance(config.get("weather", {}), dict) else {}
@@ -1662,7 +2647,6 @@ def build_config_options(config: Dict[str, Any]) -> Dict[str, Any]:
     web_cfg = config.get("web_interface", {}) if isinstance(config.get("web_interface", {}), dict) else {}
     openai_cfg = config.get("openai", {}) if isinstance(config.get("openai", {}), dict) else {}
     audio_cfg = config.get("audio", {}) if isinstance(config.get("audio", {}), dict) else {}
-    spotify_cfg = config.get("spotify", {}) if isinstance(config.get("spotify", {}), dict) else {}
     orchestrator_cfg = config.get("orchestrator", {}) if isinstance(config.get("orchestrator", {}), dict) else {}
     log_cfg = config.get("log", {}) if isinstance(config.get("log", {}), dict) else {}
     lighting_cfg = config.get("lighting", {}) if isinstance(config.get("lighting", {}), dict) else {}
@@ -1727,6 +2711,10 @@ def build_config_options(config: Dict[str, Any]) -> Dict[str, Any]:
         "music_detection_enabled": music_detection_enabled,
         "openai_model": str(openai_cfg.get("model", "")),
         "openai_prompt_style": str(openai_cfg.get("prompt_style", "")),
+        "pixazo_api_key": "",
+        "pixazo_api_key_configured": bool(str(openai_cfg.get("pixazo_api_key", "")).strip()),
+        "ai_provider": str(openai_cfg.get("provider", "openai")),
+        "pixazo_model": str(openai_cfg.get("pixazo_model", "flux-schnell")),
         "ai_dot_margin_x_px": int(display_cfg.get("ai_dot_margin_x_px", 55)),
         "ai_dot_margin_y_px": int(display_cfg.get("ai_dot_margin_y_px", 45)),
         "lighting_day": str(lighting_cfg.get("day", "")),
@@ -1743,9 +2731,6 @@ def build_config_options(config: Dict[str, Any]) -> Dict[str, Any]:
         "fallback_night_portrait": str(image_cfg.get("fallback_image_path_night_portrait", "")),
         "fallback_day_landscape": str(image_cfg.get("fallback_image_path_day_landscape", "")),
         "fallback_night_landscape": str(image_cfg.get("fallback_image_path_night_landscape", "")),
-        "spotify_client_id": str(spotify_cfg.get("client_id", "")),
-        "spotify_client_secret": "",
-        "spotify_client_secret_configured": bool(str(spotify_cfg.get("client_secret", "")).strip()),
         "debounce_seconds": int(orchestrator_cfg.get("debounce_seconds", 30)),
         "cache_ttl_seconds": int(orchestrator_cfg.get("cache_ttl_seconds", 86400)),
         "cache_size": int(orchestrator_cfg.get("cache_size", 512)),
@@ -1764,7 +2749,7 @@ def _set_nested(config: Dict[str, Any], path: list[str], value: Any) -> None:
     current[path[-1]] = value
 
 
-def apply_config_options(config: Dict[str, Any], options: Dict[str, Any]) -> Dict[str, Any]:
+def apply_config_options(config: Dict[str, Any], options: Dict[str, Any], persist_toggle_updates: bool = True) -> Dict[str, Any]:
   updated = json.loads(json.dumps(config))
 
   _set_nested(updated, ["web_interface", "enabled"], bool(options.get("web_enabled", True)))
@@ -1828,8 +2813,6 @@ def apply_config_options(config: Dict[str, Any], options: Dict[str, Any]) -> Dic
   if debug_audio_enabled:
     _set_nested(updated, ["audio", "debugaudio_path"], str(options.get("debug_audio_path", "")))
 
-  _set_nested(updated, ["display", "text_alignment_portrait"], str(options.get("text_alignment_portrait", "left")))
-  _set_nested(updated, ["display", "text_alignment_landscape"], str(options.get("text_alignment_landscape", "left")))
   _set_nested(updated, ["image", "fallback_image_path_day_portrait"], str(options.get("fallback_day_portrait", "")))
   _set_nested(updated, ["image", "fallback_image_path_night_portrait"], str(options.get("fallback_night_portrait", "")))
   _set_nested(updated, ["image", "fallback_image_path_day_landscape"], str(options.get("fallback_day_landscape", "")))
@@ -1842,25 +2825,26 @@ def apply_config_options(config: Dict[str, Any], options: Dict[str, Any]) -> Dic
 
   _set_nested(updated, ["openai", "model"], str(options.get("openai_model", "")))
   _set_nested(updated, ["openai", "prompt_style"], str(options.get("openai_prompt_style", "")))
+  _set_nested(updated, ["openai", "provider"], str(options.get("ai_provider", "openai")))
+  _set_nested(updated, ["openai", "pixazo_model"], str(options.get("pixazo_model", "flux-schnell")))
+  pixazo_api_key = options.get("pixazo_api_key")
+  if isinstance(pixazo_api_key, str):
+    pixazo_api_key = pixazo_api_key.strip()
+    if pixazo_api_key and pixazo_api_key != MASKED_SECRET_VALUE:
+      _set_nested(updated, ["openai", "pixazo_api_key"], pixazo_api_key)
 
   openai_enabled = bool(options.get("openai_enabled", True))
   music_detection_enabled = bool(options.get("music_detection_enabled", True))
-  write_toggle_state_updates({
-    "openai_enabled": openai_enabled,
-    "music_detection_enabled": music_detection_enabled,
-  })
+  if persist_toggle_updates:
+    write_toggle_state_updates({
+      "openai_enabled": openai_enabled,
+      "music_detection_enabled": music_detection_enabled,
+    })
   api_key = options.get("openai_api_key")
   if openai_enabled and isinstance(api_key, str):
     api_key = api_key.strip()
     if api_key and api_key != MASKED_SECRET_VALUE:
       _set_nested(updated, ["openai", "api_key"], api_key)
-
-  _set_nested(updated, ["spotify", "client_id"], str(options.get("spotify_client_id", "")))
-  spotify_client_secret = options.get("spotify_client_secret")
-  if isinstance(spotify_client_secret, str):
-    spotify_client_secret = spotify_client_secret.strip()
-    if spotify_client_secret and spotify_client_secret != MASKED_SECRET_VALUE:
-      _set_nested(updated, ["spotify", "client_secret"], spotify_client_secret)
 
   _set_nested(updated, ["orchestrator", "debounce_seconds"], int(options.get("debounce_seconds", 30)))
   _set_nested(updated, ["orchestrator", "cache_ttl_seconds"], int(options.get("cache_ttl_seconds", 86400)))
@@ -1891,49 +2875,6 @@ def write_toggle_state_updates(updates: Dict[str, Any]) -> None:
   SETTINGS_STORE.save_toggle_state(updates)
 
 
-def _build_spotify_redirect_uri(host_header: str) -> str:
-  host = (host_header or "").strip()
-  if not host:
-    raise ValueError("Missing Host header for Spotify redirect URI.")
-  return f"http://{host}/api/spotify-auth/callback"
-
-
-def _build_spotify_oauth(config: Dict[str, Any], redirect_uri: str) -> SpotifyOAuth:
-  spotify_cfg = config.get("spotify", {}) if isinstance(config.get("spotify", {}), dict) else {}
-  client_id = str(spotify_cfg.get("client_id", "")).strip()
-  client_secret = str(spotify_cfg.get("client_secret", "")).strip()
-  if not client_id or not client_secret:
-    raise ValueError("Spotify client ID and client secret must be set before authorizing.")
-
-  return SpotifyOAuth(
-    client_id=client_id,
-    client_secret=client_secret,
-    redirect_uri=redirect_uri,
-    scope="",
-    open_browser=False,
-    cache_handler=SpotifyDbCacheHandler(SETTINGS_STORE),
-  )
-
-
-def build_spotify_auth_status(config: Dict[str, Any], redirect_uri: str) -> Dict[str, Any]:
-  spotify_cfg = config.get("spotify", {}) if isinstance(config.get("spotify", {}), dict) else {}
-  client_id = str(spotify_cfg.get("client_id", "")).strip()
-  client_secret = str(spotify_cfg.get("client_secret", "")).strip()
-  token_info = SETTINGS_STORE.load_spotify_auth_token()
-  expires_at = token_info.get("expires_at") if isinstance(token_info, dict) else None
-  now_seconds = int(datetime.utcnow().timestamp())
-  is_valid = isinstance(expires_at, int) and expires_at > now_seconds
-
-  return {
-    "configured": bool(client_id and client_secret),
-    "has_token": bool(token_info),
-    "updated_at": SETTINGS_STORE.spotify_auth_token_updated_at(),
-    "expires_at": expires_at if isinstance(expires_at, int) else None,
-    "is_valid": is_valid,
-    "redirect_uri": redirect_uri,
-  }
-
-
 def build_cache_stats_payload() -> Dict[str, Any]:
   db_path = SETTINGS_STORE._database_path
   db_size = db_path.stat().st_size if db_path.exists() else 0
@@ -1945,10 +2886,6 @@ def build_cache_stats_payload() -> Dict[str, Any]:
     if isinstance(raw_fetched_at, str) and raw_fetched_at.strip():
       weather_fetched_at = raw_fetched_at
 
-  spotify_token = SETTINGS_STORE.load_spotify_auth_token()
-  expires_at = spotify_token.get("expires_at") if isinstance(spotify_token, dict) else None
-  now_seconds = int(datetime.utcnow().timestamp())
-
   return {
     "database_path": str(db_path),
     "database_size_bytes": int(db_size),
@@ -1958,19 +2895,13 @@ def build_cache_stats_payload() -> Dict[str, Any]:
       "updated_at": SETTINGS_STORE.weather_cache_updated_at(),
       "fetched_at": weather_fetched_at,
     },
-    "spotify_auth_cache": {
-      "present": bool(spotify_token),
-      "updated_at": SETTINGS_STORE.spotify_auth_token_updated_at(),
-      "expires_at": expires_at if isinstance(expires_at, int) else None,
-      "is_valid": isinstance(expires_at, int) and expires_at > now_seconds,
-    },
   }
 
 
 def build_stream_payload(host_header: str, event_limit: int = 80) -> Dict[str, Any]:
   config = load_config_data()
   toggle = load_toggle_state()
-  redirect_uri = _build_spotify_redirect_uri(host_header)
+  _ = host_header
   log_path = resolve_log_file_path(config)
   return {
     "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -1980,16 +2911,12 @@ def build_stream_payload(host_header: str, event_limit: int = 80) -> Dict[str, A
       "events": read_recent_events(log_path, event_limit),
     },
     "cache_stats": build_cache_stats_payload(),
-    "spotify_auth": build_spotify_auth_status(config, redirect_uri),
   }
 
 
 class ConfigManagerHandler(BaseHTTPRequestHandler):
   def _ensure_authorized(self, path: str, query: Dict[str, list[str]]) -> bool:
     if not (path.startswith("/api") or path.startswith("/current-image")):
-      return True
-
-    if path == "/api/spotify-auth/callback":
       return True
 
     config = load_config_data()
@@ -2085,7 +3012,12 @@ class ConfigManagerHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
         except Exception as exc:
-            self._send_json({"error": f"Failed to rotate image preview: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            # If rotation fails (for example while image is being rewritten),
+            # serve the source file so the admin panel still has a live preview.
+            try:
+              self._send_file(file_path)
+            except Exception:
+              self._send_json({"error": f"Failed to rotate image preview: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
   def do_GET(self) -> None:
       parsed_url = urlsplit(self.path)
@@ -2118,15 +3050,15 @@ class ConfigManagerHandler(BaseHTTPRequestHandler):
         try:
           config = load_config_data()
           log_path = resolve_log_file_path(config)
-          requested = query.get("limit", ["120"])[0]
-          events = read_recent_events(log_path, int(requested))
-          payload = {
+          raw_limit = (query.get("limit", ["120"]) or ["120"])[0]
+          try:
+            limit = int(str(raw_limit))
+          except (TypeError, ValueError):
+            limit = 120
+          self._send_json({
             "log_path": str(log_path),
-            "events": events,
-          }
-          self._send_json(payload)
-        except ValueError:
-          self._send_json({"error": "Invalid 'limit' query value."}, HTTPStatus.BAD_REQUEST)
+            "events": read_recent_events(log_path, limit),
+          })
         except Exception as exc:
           self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         return
@@ -2134,10 +3066,12 @@ class ConfigManagerHandler(BaseHTTPRequestHandler):
       if path == "/api/debug-audio":
         try:
           config = load_config_data()
-          requested = query.get("limit", ["30"])[0]
-          self._send_json(list_debug_audio_entries(config, int(requested)))
-        except ValueError:
-          self._send_json({"error": "Invalid debug audio request."}, HTTPStatus.BAD_REQUEST)
+          raw_limit = (query.get("limit", ["30"]) or ["30"])[0]
+          try:
+            limit = int(str(raw_limit))
+          except (TypeError, ValueError):
+            limit = 30
+          self._send_json(list_debug_audio_entries(config, limit))
         except Exception as exc:
           self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         return
@@ -2145,13 +3079,15 @@ class ConfigManagerHandler(BaseHTTPRequestHandler):
       if path == "/api/debug-audio/file":
         try:
           config = load_config_data()
-          name = str((query.get("name", [""]) or [""])[0]).strip()
-          file_path = resolve_debug_audio_file(config, name)
-          self._send_file(file_path)
-        except ValueError as exc:
-          self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+          requested_name = (query.get("name", [""]) or [""])[0]
+          target_file = resolve_debug_audio_file(config, requested_name)
+          self._send_file(target_file)
         except PermissionError as exc:
           self._send_json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
+        except ValueError as exc:
+          self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        except FileNotFoundError:
+          self._send_json({"error": "Debug audio file not found."}, HTTPStatus.NOT_FOUND)
         except Exception as exc:
           self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         return
@@ -2172,51 +3108,26 @@ class ConfigManagerHandler(BaseHTTPRequestHandler):
           self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         return
 
-      if path == "/api/spotify-auth/status":
+      if path == "/api/app/status":
         try:
-          config = load_config_data()
-          redirect_uri = _build_spotify_redirect_uri(self.headers.get("Host", ""))
-          self._send_json(build_spotify_auth_status(config, redirect_uri))
+          self._send_json(get_main_service_status())
         except Exception as exc:
           self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         return
 
-      if path == "/api/spotify-auth/start":
+      if path == "/api/preview-prompt":
         try:
           config = load_config_data()
-          redirect_uri = _build_spotify_redirect_uri(self.headers.get("Host", ""))
-          oauth = _build_spotify_oauth(config, redirect_uri)
-          self._send_json({
-            "authorize_url": oauth.get_authorize_url(),
-            "redirect_uri": redirect_uri,
-          })
+          self._send_json({"prompt": _build_preview_prompt(config)})
         except Exception as exc:
-          self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+          self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         return
 
-      if path == "/api/spotify-auth/callback":
+      if path == "/api/test-ai-image/file":
         try:
-          config = load_config_data()
-          redirect_uri = _build_spotify_redirect_uri(self.headers.get("Host", ""))
-          error = query.get("error", [None])[0]
-          if error:
-            self._send_html(f"<html><body><h1>Spotify authorization failed</h1><p>{error}</p><p><a href='/'>Return to portal</a></p></body></html>")
-            return
-
-          code = query.get("code", [None])[0]
-          if not code:
-            self._send_json({"error": "Missing Spotify authorization code."}, HTTPStatus.BAD_REQUEST)
-            return
-
-          oauth = _build_spotify_oauth(config, redirect_uri)
-          oauth.get_access_token(code=code, as_dict=True, check_cache=False)
-          self._send_html(
-            "<html><body><h1>Spotify authorization complete</h1><p>The token has been saved to the database.</p><p><a href='/'>Return to the portal</a></p></body></html>"
-          )
+          self._send_file(TEST_AI_PREVIEW_PATH)
         except Exception as exc:
-          self._send_html(
-            f"<html><body><h1>Spotify authorization failed</h1><p>{exc}</p><p><a href='/'>Return to the portal</a></p></body></html>"
-          )
+          self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         return
 
       if path == "/api/current-image":
@@ -2250,18 +3161,234 @@ class ConfigManagerHandler(BaseHTTPRequestHandler):
       if not self._ensure_authorized(path, query):
         return
 
-      if path not in ("/api/config", "/api/config-options"):
-        self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
-        return
-
       try:
         content_length = int(self.headers.get("Content-Length", "0"))
         raw_payload = self.rfile.read(content_length)
         payload = json.loads(raw_payload.decode("utf-8"))
 
+        if path == "/api/validate-key":
+          config = load_config_data()
+          key_type = payload.get("key_type", "")
+          raw_key_value = str(payload.get("key_value", "")).strip()
+          use_stored_when_masked = bool(payload.get("use_stored_when_masked", False))
+
+          key_value = raw_key_value
+          if use_stored_when_masked and raw_key_value == MASKED_SECRET_VALUE:
+            if key_type == "openai_key":
+              openai_cfg = config.get("openai", {}) if isinstance(config.get("openai", {}), dict) else {}
+              key_value = str(openai_cfg.get("api_key", "")).strip()
+            elif key_type == "pixazo_key":
+              openai_cfg = config.get("openai", {}) if isinstance(config.get("openai", {}), dict) else {}
+              key_value = str(openai_cfg.get("pixazo_api_key", "")).strip()
+            elif key_type == "openweather_key":
+              weather_cfg = config.get("weather", {}) if isinstance(config.get("weather", {}), dict) else {}
+              key_value = str(weather_cfg.get("openweathermap_api_key", "")).strip()
+          if not key_value:
+            self._send_json({"valid": False, "reason": "Empty key"})
+            return
+
+          valid = False
+          reason = ""
+          if key_type == "admin_token":
+            valid = len(key_value) >= 8
+            reason = "Admin token must be at least 8 characters" if not valid else "Admin token accepted"
+          elif key_type == "openai_key":
+            valid, reason = _validate_openai_api_key(key_value)
+          elif key_type == "pixazo_key":
+            valid, reason = _validate_pixazo_api_key(key_value)
+          elif key_type == "openweather_key":
+            valid, reason = _validate_openweather_api_key(key_value)
+          else:
+            valid = len(key_value) >= 8
+            reason = "Value must be at least 8 characters" if not valid else "Value accepted"
+
+          self._send_json({"valid": valid, "reason": reason})
+          return
+
+        if path == "/api/upload-fallback-image":
+          if not isinstance(payload, dict):
+            self._send_json({"error": "Request body must be an object."}, HTTPStatus.BAD_REQUEST)
+            return
+
+          target = str(payload.get("target", "")).strip()
+          filename = str(payload.get("filename", "")).strip()
+          content_base64 = payload.get("content_base64", "")
+          saved_path = _save_uploaded_fallback_image(target, filename, content_base64)
+          self._send_json({
+            "message": "Fallback image uploaded.",
+            "path": saved_path,
+            "target": target,
+          })
+          return
+
+        if path == "/api/fallback/use-current-generated":
+          if not isinstance(payload, dict):
+            self._send_json({"error": "Request body must be an object."}, HTTPStatus.BAD_REQUEST)
+            return
+
+          target = str(payload.get("target", "")).strip()
+          config_key = FALLBACK_TARGET_TO_CONFIG_KEY.get(target)
+          if not config_key:
+            self._send_json({"error": "Unsupported fallback target."}, HTTPStatus.BAD_REQUEST)
+            return
+
+          try:
+            config = load_config_data()
+            saved_path = _save_current_generated_image_as_fallback(target, config)
+            _set_nested(config, ["image", config_key], saved_path)
+            write_config_data(config)
+            self._send_json(
+              {
+                "message": "Fallback image updated from current generated image.",
+                "target": target,
+                "path": saved_path,
+              }
+            )
+          except FileNotFoundError as exc:
+            self._send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+          except ValueError as exc:
+            self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+          return
+
+        if path == "/api/preview-prompt":
+          options = payload if isinstance(payload, dict) else {}
+          preview_config = build_preview_config_from_options(options)
+          self._send_json({"prompt": _build_preview_prompt(preview_config)})
+          return
+
+        if path == "/api/test-ai-image":
+          options = payload if isinstance(payload, dict) else {}
+          preview_config = build_preview_config_from_options(options)
+          try:
+            ai_service = AIBackgroundService(config_override=preview_config, output_override=str(TEST_AI_PREVIEW_PATH))
+            result = ai_service.generate_test_image(str(TEST_AI_PREVIEW_PATH), prompt_override=_build_preview_prompt(preview_config))
+            self._send_json({
+              "message": f"Test image generated using {result.get('provider', 'openai')} ({result.get('model', '')}).",
+              "prompt": result.get("prompt", ""),
+              "size": result.get("size", ""),
+            })
+          except Exception as exc:
+            openai_cfg = preview_config.get("openai", {}) if isinstance(preview_config.get("openai", {}), dict) else {}
+            provider = str(openai_cfg.get("provider", "openai") or "openai")
+            hint = (
+              "Check Pixazo API key, selected model, and network connectivity."
+              if provider == "pixazo"
+              else "Check OpenAI API key, selected model, and account permissions."
+            )
+            error_text = str(exc).strip() or exc.__class__.__name__
+            self._send_json(
+              {
+                "error": f"Test image generation failed: {error_text}",
+                "provider": provider,
+                "error_type": exc.__class__.__name__,
+                "hint": hint,
+              },
+              HTTPStatus.BAD_GATEWAY,
+            )
+          return
+
+        if path == "/api/debug-audio/delete":
+          if not isinstance(payload, dict):
+            self._send_json({"error": "Request body must be an object."}, HTTPStatus.BAD_REQUEST)
+            return
+
+          file_name = str(payload.get("name", "")).strip()
+          if not file_name:
+            self._send_json({"error": "Missing debug audio file name."}, HTTPStatus.BAD_REQUEST)
+            return
+
+          config = load_config_data()
+          try:
+            deleted = delete_debug_audio_file(config, file_name)
+            self._send_json({"message": f"Deleted debug recording: {deleted.name}", "name": deleted.name})
+          except PermissionError as exc:
+            self._send_json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
+          except ValueError as exc:
+            self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+          except FileNotFoundError as exc:
+            self._send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+          return
+
+        if path == "/api/debug-audio/delete-all":
+          if not isinstance(payload, dict):
+            self._send_json({"error": "Request body must be an object."}, HTTPStatus.BAD_REQUEST)
+            return
+
+          if payload.get("confirm") is not True:
+            self._send_json({"error": "Confirmation required to delete all debug recordings."}, HTTPStatus.BAD_REQUEST)
+            return
+
+          config = load_config_data()
+          result = delete_all_debug_audio_files(config)
+          deleted_count = int(result.get("deleted_count", 0))
+          failed_count = int(result.get("failed_count", 0))
+          failed_names = result.get("failed_names", [])
+
+          if failed_count > 0:
+            self._send_json(
+              {
+                "error": f"Deleted {deleted_count} files, but {failed_count} could not be removed.",
+                "deleted_count": deleted_count,
+                "failed_count": failed_count,
+                "failed_names": failed_names,
+              },
+              HTTPStatus.MULTI_STATUS,
+            )
+          else:
+            self._send_json({"message": f"Deleted {deleted_count} debug recordings.", "deleted_count": deleted_count})
+          return
+
+        if path == "/api/events/clear":
+          if not isinstance(payload, dict):
+            self._send_json({"error": "Request body must be an object."}, HTTPStatus.BAD_REQUEST)
+            return
+
+          if payload.get("confirm") is not True:
+            self._send_json({"error": "Confirmation required to clear the event log."}, HTTPStatus.BAD_REQUEST)
+            return
+
+          config = load_config_data()
+          result = clear_event_log(config)
+          self._send_json(
+            {
+              "message": f"Event log cleared ({result.get('cleared_bytes', 0)} bytes removed).",
+              "log_path": result.get("log_path", ""),
+              "cleared_bytes": result.get("cleared_bytes", 0),
+            }
+          )
+          return
+
+        if path == "/api/app/restart":
+          if not isinstance(payload, dict):
+            self._send_json({"error": "Request body must be an object."}, HTTPStatus.BAD_REQUEST)
+            return
+
+          if payload.get("confirm") is not True:
+            self._send_json({"error": "Confirmation required to restart the app service."}, HTTPStatus.BAD_REQUEST)
+            return
+
+          try:
+            self._send_json(restart_main_service())
+          except Exception as exc:
+            self._send_json(
+              {
+                "error": f"Failed to restart now-playing.service: {exc}",
+                "hint": "Ensure sudoers allows this web service user to run systemctl restart now-playing.service without a password.",
+              },
+              HTTPStatus.BAD_GATEWAY,
+            )
+          return
+
+        if path not in ("/api/config", "/api/config-options", "/api/preview-prompt", "/api/test-ai-image", "/api/upload-fallback-image", "/api/fallback/use-current-generated", "/api/debug-audio/delete", "/api/debug-audio/delete-all", "/api/events/clear", "/api/app/restart"):
+          self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
+          return
+
         if path == "/api/config-options":
           config = load_config_data()
-          options = payload if isinstance(payload, dict) else {}
+          base_options = build_config_options(config)
+          options = dict(base_options)
+          if isinstance(payload, dict):
+            options.update(payload)
           updated = apply_config_options(config, options)
           write_config_data(updated)
           write_selected_orientation(str(options.get("selected_orientation", "portrait")))
@@ -2274,8 +3401,6 @@ class ConfigManagerHandler(BaseHTTPRequestHandler):
           return
 
         backup_path = backup_config()
-        if backup_path is not None:
-          _ = backup_path
         SETTINGS_STORE.save_config(config_payload)
 
         self._send_json(

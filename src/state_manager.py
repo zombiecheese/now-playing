@@ -12,7 +12,7 @@ class DisplayState(Enum):
     CLEAN = 0
     PLAYING = 1
     SCREENSAVER = 2
-    UNKNOWN = 5
+    UNKNOWN = 3
 
 
 class StateData:

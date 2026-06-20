@@ -5,8 +5,6 @@ import numpy as np
 from config import Config
 from typing import Optional, Tuple
 
-import sys
-sys.path.append("..")
 from logger import Logger
 
 

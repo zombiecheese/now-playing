@@ -4,18 +4,18 @@
 song, and displays the song information on an e-ink display.
 
 
-This, like any good project is a fork of a fork of a fork.
-all thanks to the hard work of..
+Like many great Raspberry Pi projects, this one is a fork of a fork of a fork.
+Huge thanks to the maintainers of:
 
 - [spotipi-eink (original)](https://github.com/ryanwa18/spotipi-eink)
 - [spotipi-eink (fork)](https://github.com/Gabbajoe/spotipi-eink)
 - [shazampi-eink (fork)](https://github.com/ravi72munde/shazampi-eink)
 
-special shout out to maurocastermans - im even keeping 90% of your read me :P
+Special shout out to maurocastermans:
 - [now-playing (fork)](https://github.com/maurocastermans/now-playing)
 
 
-All credits for the original idea go to them. While they laid the groundwork, this version focuses on dumb ai add ons and over engineered weather details 
+All credits for the original idea go to them. This version builds on that foundation with AI image features, richer weather context, and a more complete admin experience.
 
 
 
@@ -28,7 +28,10 @@ All credits for the original idea go to them. While they laid the groundwork, th
 - **Button A**: Toggles music detection and song lookup on/off
 - **Button B**: Toggles AI background generation on/off (switches between generated backgrounds and static fallback images)
 - **Button C**: Cycles through display orientations (portrait/landscape) and rotations
-- **AI-Generated Backgrounds**: Uses OpenAI's image generation to create weather-aware, time-of-day appropriate screensaver backgrounds
+- **AI-Generated Backgrounds**: Uses OpenAI or Pixazo image generation to create weather-aware, time-of-day appropriate screensaver backgrounds
+- **Orientation-Aware Fallback Controls**: The admin portal shows fallback image controls that match the selected orientation, keeping portrait and landscape tuning separate and clear
+- **Fast Fallback Authoring**: "Use Current Generated" can copy the current generated image into day/night fallback slots (shown only while AI generation is enabled)
+- **Admin Service Controls**: The web portal can show main app health and restart the main runtime service without taking down the portal
 - When no music is detected for a while, the display switches to a screensaver mode that shows the weather with dynamic or static backgrounds
 
 ## 🎮 Button Controls
@@ -43,7 +46,7 @@ Press Button A to toggle the audio pipeline:
 Press Button B to toggle between AI-generated backgrounds and static fallback images for the screensaver:
 - **AI Mode ON** (default): Generates unique weather-aware backgrounds based on current conditions, time of day, and your configured style
 - **AI Mode OFF**: Uses static fallback images (day/night variants available)
-- A small red dot appears on the screensaver when in fallback mode
+- A small red dot appears on the screensaver when AI generation is disabled
 - When re-enabling AI mode, a new background is immediately generated
 
 ### Button C - Cycle Display Orientation
@@ -58,9 +61,9 @@ The display immediately redraws with the new orientation, and your preference is
 ## ✨ What's New?
 
 
-### 🤖 OpenAI Integration
+### 🤖 AI Image Provider Integration
 
-- **Dynamic Background Generation**: Uses OpenAI's image generation API to create unique screensaver backgrounds
+- **Dynamic Background Generation**: Uses an AI image provider (OpenAI or Pixazo) to create unique screensaver backgrounds
 - **Weather-Aware**: Incorporates current weather conditions, temperature, and location into the generated imagery
 - **Time-of-Day Adaptation**: Automatically adjusts lighting, color temperature, and scene elements based on:
   - Daytime: Natural brightness, realistic shadows, balanced contrast
@@ -70,7 +73,7 @@ The display immediately redraws with the new orientation, and your preference is
 - **Customizable Style**: Configure your preferred artistic style (e.g., "80s anime", "cyberpunk", "impressionist painting")
 - **Smart Caching**: Generated images are cached and refreshed on a configurable schedule (default: every 6 hours)
 - **Fallback Support**: Automatically falls back to static images if API is unavailable or disabled
-- **Model Flexibility**: Supports multiple OpenAI image models (DALL-E 2/3, GPT-Image variants)
+- **Provider Flexibility**: Supports OpenAI image models (DALL-E 2/3, GPT-Image variants) and Pixazo text-to-image generation
 - **Orientation-Aware**: Generates images in the appropriate aspect ratio for your display orientation
 
 ### ♻️ Improvements
@@ -124,28 +127,12 @@ The display immediately redraws with the new orientation, and your preference is
 1. Go to [Google Maps](https://www.google.com/maps) → Search your location → Right-click → Copy coordinates
 2. Store it, you will need it later
 
-#### 🎵 Spotify API
+#### 🖼️ AI Provider API Key
 
-1. Go to the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)
-2. Click 'Create App' and fill out the form:
-    1. App name
-    2. App description
-    3. Redirect URI = http://127.0.0.1:8888/callback
-    4. Check 'Web API'
-    5. Check the 'Terms of Service'
-3. Click on 'Save'
-4. Store your Client ID and Client Secret, you will need it later
+Configure one provider in the admin portal:
+- OpenAI: set your OpenAI API key
+- Pixazo: set your Pixazo API key and preferred Pixazo model
 
-#### 🎟 Spotify Access Token
-
-Spotify authorization is now handled from the web admin portal:
-
-1. Open the admin portal in your browser.
-2. Enter your Spotify client ID and client secret in the portal.
-3. Click **Open Spotify Login** in the Spotify Authorization section.
-4. Complete the Spotify consent screen, then return to the portal and refresh the auth status.
-
-The access token and refresh token are stored in the SQLite settings database, so there is no separate `.cache` file to copy around anymore.
 
 ### ⚙️ Installation Script
 
@@ -153,7 +140,7 @@ SSH into your Raspberry Pi:
 
 ```bash
   ssh <username>@<ip-address>
-``
+```
 
 And run:
 
@@ -163,12 +150,14 @@ And run:
   bash ./setup.sh
 ```
 
-Spotipy will now automatically refresh the access token when it expires, using the refresh token stored in the database.
+The `setup.sh` script installs and starts both systemd services:
+- `now-playing.service` (main runtime)
+- `now-playing-web.service` (admin portal)
 
-The `setup.sh` script will automatically start the now-playing systemd service. Verify that the service starts without
-errors:
+Verify both services start without errors:
 
 ```bash
+  journalctl -u now-playing-web.service --follow
   journalctl -u now-playing.service --follow
 ```
 
@@ -180,14 +169,15 @@ Should you encounter any errors, check [Known Issues](#-known-issues)
 > - Updates the system and installs dependencies
 > - Sets up a Python virtual environment and installs Python packages
 > - Creates config, log, and resources directories
-> - Starts the service and lets the admin portal initialize the SQLite settings store
-> - Copies and configures a systemd service to autostart on boot
-> - Starts the now-playing service
+> - Installs and starts both services (`now-playing.service` and `now-playing-web.service`)
+> - Lets the admin portal initialize the SQLite settings store on first run
+> - Configures systemd services to autostart on boot
+> - Configures sudoers so the web service can restart/check the main service
 
 > 📂 <b>Settings Store (SQLite)</b>
 >
 > The app now stores configuration in a disk-backed SQLite settings store that is initialized and edited through the admin portal.
-> The portal exposes the same layout, image, weather, Spotify, OpenAI, audio, logging, and orientation settings as form controls.
+> The portal exposes the same layout, image, weather, OpenAI, audio, logging, and orientation settings as form controls.
 > Legacy YAML and JSON files are only used as one-time migration inputs when present.
 
 ## 🛠 Useful Commands
@@ -202,7 +192,8 @@ Open the admin portal and save changes there. The portal persists settings to th
 
 You can manage the SQLite-backed settings store from a browser and preview the currently selected screensaver image.
 
-The web manager starts automatically when `now_playing.py` starts (including when run by systemd).
+The web manager runs as a dedicated `now-playing-web` systemd service, independent from the main `now-playing` runtime.
+This allows the admin portal to restart the main app service without taking the portal down.
 
 Run the manager:
 
@@ -221,12 +212,15 @@ What it supports:
 - Structured editing of all supported settings through the admin form
 - Automatic backups of the SQLite database before config saves
 - Current display preview image including rendered overlays (song/weather text, orientation, AI indicator dot)
+- Orientation-specific fallback image management (portrait/landscape and day/night)
+- One-click copy of the current generated image into fallback slots when AI generation is enabled
+- Main app service status checks and restart action from the portal
 
 Notes:
 - The portal persists changes directly to the database; no manual file editing is required
 - The image preview is based on current fallback mode, orientation, and day/night assumptions
 
-### � Update Script
+### 🔄 Update Script
 
 The `update.sh` script makes updating your installation simple and safe:
 
@@ -235,27 +229,24 @@ The `update.sh` script makes updating your installation simple and safe:
 ```
 
 **What it does:**
-- Stops the now-playing service
+- Stops both services
 - Fetches the latest code from the GitHub repository
 - Resets your installation to the latest version (preserves the SQLite settings database and cache files)
 - Updates Python dependencies to their latest versions
-- Prompts you to restart the service
+- Reinstalls unit files and restarts both services
 
 **Important Notes:**
 - Your SQLite settings database is preserved
 - Must be run as a regular user (not root)
 - Requires an active internet connection
-- After completion, manually restart the service:
-  ```bash
-  sudo systemctl start now-playing
-  ```
 
-### �🔁 Systemd Service
+### 🔁 Systemd Services
 
 - Check status:
 
 ```bash
   sudo systemctl status now-playing.service
+  sudo systemctl status now-playing-web.service
 ```
 
 - Start/Stop:
@@ -263,6 +254,8 @@ The `update.sh` script makes updating your installation simple and safe:
 ```bash
   sudo systemctl stop now-playing.service
   sudo systemctl start now-playing.service
+  sudo systemctl stop now-playing-web.service
+  sudo systemctl start now-playing-web.service
 ```
 
 - Logs:
@@ -272,6 +265,7 @@ The `update.sh` script makes updating your installation simple and safe:
   journalctl -u now-playing.service --follow
   journalctl -u now-playing.service --since today
   journalctl -u now-playing.service -b
+  journalctl -u now-playing-web.service --follow
 ```
 
 ### 🧪 Manual Python Execution

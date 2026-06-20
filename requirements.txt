@@ -7,8 +7,6 @@ shazamio
 librosa
 inky
 tflite-runtime
-typing
-pyyaml
-spotipy
+PyYAML
 openai
 astral>=2.2

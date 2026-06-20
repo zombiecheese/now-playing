@@ -8,8 +8,6 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from shazamio import Shazam
 from dataclasses import dataclass
 
-import sys
-sys.path.append("..")
 from logger import Logger
 
 
@@ -127,4 +125,5 @@ class SongIdentifyService:
                 for tok in reversed(tokens):
                     if tok.isdigit() and len(tok) == 4:
                         return tok
-       
+        return None
+

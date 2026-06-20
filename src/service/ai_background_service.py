@@ -4,7 +4,8 @@ import datetime
 import logging
 import os
 import shutil
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import Literal, Optional, Tuple, cast
 
 import requests  # for city name & weather description when needed
 import traceback
@@ -26,15 +27,28 @@ except Exception:
     _ASTRAL_OK = False
 
 
+OpenAIImageSize = Literal[
+    "auto",
+    "1024x1024",
+    "1536x1024",
+    "1024x1536",
+    "256x256",
+    "512x512",
+    "1792x1024",
+    "1024x1792",
+]
+
+
 class AIBackgroundService:
 
-    def __init__(self) -> None:
+    def __init__(self, config_override: Optional[dict] = None, output_override: Optional[str] = None) -> None:
         self._logger: logging.Logger = Logger().get_logger()
-        self._config: dict = Config().get_config()
+        self._config: dict = config_override if isinstance(config_override, dict) else Config().get_config()
 
         # Output path (same as your DisplayService reads)
         self._outfile = (
-            self._config.get("display", {}).get("weather_background_image")
+            output_override
+            or self._config.get("display", {}).get("weather_background_image")
             or "resources/ai_screensaver.png"
         )
 
@@ -66,8 +80,11 @@ class AIBackgroundService:
         openai_cfg = self._config.get("openai", {}) or {}
         image_cfg = self._config.get("image", {}) or {}
         lighting_cfg = self._config.get("lighting", {}) or {}
+        self._provider = str(openai_cfg.get("provider") or "openai").strip().lower()
+        self._pixazo_model = str(openai_cfg.get("pixazo_model") or "flux-schnell").strip()
 
-        self._api_key = openai_cfg.get("api_key") or os.environ.get("OPENAI_API_KEY") or ""
+        self._openai_api_key = openai_cfg.get("api_key") or os.environ.get("OPENAI_API_KEY") or ""
+        self._pixazo_api_key = openai_cfg.get("pixazo_api_key") or os.environ.get("PIXAZO_API_KEY") or ""
 
         # Legacy single-path fallback (used when orientation-aware images are not configured)
         self._fallback_image_path = image_cfg.get("fallback_image_path") or ""
@@ -121,20 +138,26 @@ class AIBackgroundService:
         self._image_size: Optional[str] = None
         self._model_info: Optional[dict] = None
 
-        if not self._api_key:
+        if self._openai_api_key:
+            try:
+                self._client = OpenAI(api_key=self._openai_api_key)
+            except Exception as e:
+                self._logger.error(f"Failed to initialize OpenAI client: {e}")
+        elif self._provider == "openai":
             self._logger.warning(
                 "OpenAI API key missing. AI background generation will use fallback."
             )
-        else:
-            try:
-                self._client = OpenAI(api_key=self._api_key)
-            except Exception as e:
-                self._logger.error(f"Failed to initialize OpenAI client: {e}")
+        elif self._provider == "pixazo" and not self._pixazo_api_key:
+            self._logger.warning(
+                "Pixazo API key missing. AI background generation will use fallback."
+            )
         # Log OpenAI-related configuration (do NOT log API key)
         try:
             self._logger.debug(
-                "OpenAI configuration: model=%s, client_initialized=%s, max_image_dimension=%s, max_square_size=%s",
+                "AI image configuration: provider=%s model=%s pixazo_model=%s client_initialized=%s max_image_dimension=%s max_square_size=%s",
+                self._provider,
                 self._image_model,
+                self._pixazo_model,
                 bool(self._client),
                 self._max_image_dimension,
                 self._max_square_size,
@@ -252,6 +275,8 @@ class AIBackgroundService:
 
         if _ASTRAL_OK:
             try:
+                if self._lat is None or self._lon is None:
+                    raise ValueError("Coordinates not available for Astral computation")
                 obs = Observer(latitude=float(self._lat), longitude=float(self._lon), elevation=0.0)
                 if is_day:
                     az = float(sun_azimuth(obs, now_utc))
@@ -755,7 +780,16 @@ class AIBackgroundService:
             "dall-e-3": {"supports_non_square": False, "preferred_sizes": ["1024x1024"], "default": "1024x1024"},
         }
 
-        model_info = defaults.get(model, defaults.get("gpt-image-1")).copy()
+        model_info_source = defaults.get(model)
+        if model_info_source is None and isinstance(model, str) and model.startswith("gpt-image-"):
+            model_info_source = defaults.get("gpt-image-1")
+        if model_info_source is None:
+            model_info_source = {
+                "supports_non_square": True,
+                "preferred_sizes": ["1024x1024"],
+                "default": "1024x1024",
+            }
+        model_info = model_info_source.copy()
         # apply overrides
         if "supports_non_square" in cfg:
             model_info["supports_non_square"] = bool(cfg.get("supports_non_square"))
@@ -767,18 +801,15 @@ class AIBackgroundService:
 
     def _prepare_context(self) -> None:
         """Compute and cache all per-refresh decisions (weather, astro, lighting, model, size)."""
-        # refresh weather cache
+        # Refresh weather cache
         try:
             self._fetch_weather_data()
         except Exception:
             self._weather_cache = None
 
-        # set city/weather fields for prompt building
-        city, desc = self._fetch_city_and_weather_desc()
-        self._city = city
-        self._weather_desc = desc
+        city, weather_desc = self._fetch_city_and_weather_desc()
 
-        # astro text and lighting text (these functions will use cached weather)
+        # Astro text and lighting text (these functions will use cached weather)
         # Reset astro cache per refresh so azimuth/phase reflect current time
         self._astro_text = None
         try:
@@ -790,19 +821,36 @@ class AIBackgroundService:
         except Exception:
             self._lighting_text = None
 
-        # model info + chosen image size
+        # Model info + chosen image size
         try:
             self._model_info = self._get_model_info(str(self._image_model))
             self._image_size = self._choose_image_size()
         except Exception:
             self._model_info = None
             self._image_size = None
+
+    def _coerce_openai_image_size(self, size: str) -> OpenAIImageSize:
+        """Normalize dynamic size strings into the OpenAI SDK's accepted literal size values."""
+        allowed_sizes = {
+            "auto",
+            "1024x1024",
+            "1536x1024",
+            "1024x1536",
+            "256x256",
+            "512x512",
+            "1792x1024",
+            "1024x1792",
+        }
+        if isinstance(size, str) and size in allowed_sizes:
+            return cast(OpenAIImageSize, size)
+        return "1024x1024"
+
         # Log prepared context (weather/time/OpenAI-related) for diagnostics
         try:
             self._logger.info(
                 "Prepared context: city=%s, weather=%s, astro=%s, lighting=%s, model=%s, model_info=%s, image_size=%s",
-                getattr(self, "_city", None),
-                getattr(self, "_weather_desc", None),
+                city,
+                weather_desc,
                 getattr(self, "_astro_text", None),
                 getattr(self, "_lighting_text", None),
                 getattr(self, "_image_model", None),
@@ -828,6 +876,149 @@ class AIBackgroundService:
             f" Incorporate the area's local train system and accurate city skyline into the composition and ensure that the major details are cropped within a centered 480px wide area."
         )
 
+    def _download_image_to_file(self, image_url: str, output_path: str, timeout: float = 20.0) -> None:
+        response = requests.get(image_url, timeout=timeout)
+        response.raise_for_status()
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(response.content)
+
+    def _pixazo_image_dimensions(self) -> Tuple[int, int]:
+        orientation = self._get_current_orientation()
+        if orientation == "landscape":
+            return 1024, 512
+        return 512, 1024
+
+    def _generate_pixazo_text_to_image(self, prompt: str, output_path: str) -> dict:
+        if not self._pixazo_api_key:
+            raise ValueError("Pixazo API key is not configured.")
+
+        model = self._pixazo_model or "flux-schnell"
+        if model != "flux-schnell":
+            raise ValueError(f"Pixazo model '{model}' is not supported yet. Supported free model: flux-schnell.")
+
+        width, height = self._pixazo_image_dimensions()
+        request_url = "https://gateway.pixazo.ai/flux-1-schnell/v1/getData"
+        headers = {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-cache",
+            "Ocp-Apim-Subscription-Key": self._pixazo_api_key,
+        }
+        payload = {
+            "prompt": prompt,
+            "num_steps": 4,
+            "width": width,
+            "height": height,
+        }
+
+        response = requests.post(request_url, headers=headers, json=payload, timeout=180)
+        if response.status_code != 200:
+            try:
+                error_payload = response.json()
+                error_message = error_payload.get("message") or error_payload.get("error") or str(error_payload)
+            except Exception:
+                error_message = response.text.strip() or f"Pixazo returned HTTP {response.status_code}"
+            raise RuntimeError(f"Pixazo generation failed: {error_message}")
+
+        data = response.json()
+        output_url = data.get("output") if isinstance(data, dict) else None
+        if not isinstance(output_url, str) or not output_url.strip():
+            raise RuntimeError("Pixazo generation did not return an output URL.")
+
+        self._download_image_to_file(output_url, output_path)
+        return {
+            "provider": "pixazo",
+            "model": model,
+            "size": f"{width}x{height}",
+            "prompt": prompt,
+            "path": output_path,
+            "image_url": output_url,
+        }
+
+    def generate_test_image(self, output_path: str, prompt_override: Optional[str] = None) -> dict:
+        if not self._coords_ok:
+            raise ValueError("Invalid geo coordinates. Update the weather geo coordinates before generating a test image.")
+        if self._provider == "pixazo":
+            self._prepare_context()
+            prompt = prompt_override or self._build_dynamic_prompt()
+            return self._generate_pixazo_text_to_image(prompt, output_path)
+        if not self._client:
+            raise ValueError("OpenAI client is not initialized. Configure a valid OpenAI API key first.")
+
+        self._prepare_context()
+        prompt = prompt_override or self._build_dynamic_prompt()
+        size = self._image_size or self._choose_image_size()
+        size_arg = self._coerce_openai_image_size(size)
+
+        result = self._client.images.generate(
+            model=self._image_model,
+            prompt=prompt,
+            size=size_arg,
+        )
+
+        image_base64 = None
+        image_url = None
+        res_dict = None
+        if isinstance(result, dict):
+            res_dict = result
+        else:
+            try:
+                res_dict = getattr(result, "__dict__", None) or None
+            except Exception:
+                res_dict = None
+
+        data_list = None
+        if res_dict and isinstance(res_dict.get("data", None), list):
+            data_list = res_dict.get("data")
+        else:
+            try:
+                data_attr = getattr(result, "data", None)
+                if isinstance(data_attr, (list, tuple)):
+                    data_list = list(data_attr)
+            except Exception:
+                data_list = None
+
+        if data_list:
+            first = data_list[0] if len(data_list) > 0 else None
+            if isinstance(first, dict):
+                image_base64 = first.get("b64_json") or first.get("b64") or first.get("base64") or first.get("image")
+                image_url = first.get("url") or first.get("image_url")
+            else:
+                image_base64 = getattr(first, "b64_json", None) or getattr(first, "b64", None) or getattr(first, "base64", None)
+                image_url = getattr(first, "url", None)
+
+        if not image_base64 and res_dict:
+            for key in ("b64_json", "b64", "base64", "image"):
+                value = res_dict.get(key)
+                if isinstance(value, str) and value:
+                    image_base64 = value
+                    break
+            if not image_url:
+                for key in ("url", "image_url", "image_url_https"):
+                    value = res_dict.get(key)
+                    if isinstance(value, str) and value:
+                        image_url = value
+                        break
+
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if image_base64:
+            output.write_bytes(base64.b64decode(image_base64))
+        elif image_url:
+            resp_img = requests.get(image_url, timeout=10.0)
+            resp_img.raise_for_status()
+            output.write_bytes(resp_img.content)
+        else:
+            raise RuntimeError("The image provider did not return an image payload.")
+
+        return {
+            "provider": self._provider,
+            "model": self._image_model,
+            "size": size,
+            "prompt": prompt,
+            "path": str(output),
+        }
+
     def refresh_background_if_needed(self) -> None:
         """Generate & save a background image if TTL has expired (with robust fallback)."""
         try:
@@ -839,6 +1030,33 @@ class AIBackgroundService:
                 self._logger.error(
                     "Coordinate parsing failed; applying fallback image and skipping generation."
                 )
+                self._apply_fallback_image()
+                return
+
+            if self._provider == "pixazo":
+                if not self._pixazo_api_key:
+                    self._logger.warning("Pixazo API key not configured; attempting fallback image.")
+                    self._apply_fallback_image()
+                    return
+                self._prepare_context()
+                prompt = self._build_dynamic_prompt()
+                try:
+                    result = self._generate_pixazo_text_to_image(prompt, self._outfile)
+                    self._last_refresh = datetime.datetime.now()
+                    self._logger.info(
+                        "Pixazo background image refreshed -> %s (model=%s size=%s)",
+                        self._outfile,
+                        result.get("model"),
+                        result.get("size"),
+                    )
+                    return
+                except Exception as pixazo_err:
+                    self._logger.error("Pixazo image generation failed: %s", pixazo_err, exc_info=True)
+                    if not self._apply_fallback_image():
+                        self._logger.warning("Fallback failed after Pixazo generation error; keeping previous background.")
+                    return
+            elif self._provider != "openai":
+                self._logger.warning("AI image provider '%s' is not implemented in runtime generation; applying fallback image.", self._provider)
                 self._apply_fallback_image()
                 return
 
@@ -855,6 +1073,7 @@ class AIBackgroundService:
             prompt = self._build_dynamic_prompt()
             # prefer the prepared image size if available
             size = self._image_size or self._choose_image_size()
+            size_arg = self._coerce_openai_image_size(size)
             self._logger.debug("OpenAI image prompt: %s", prompt)
             self._logger.debug("Image generation model=%s size=%s", self._image_model, size)
             try:
@@ -873,7 +1092,7 @@ class AIBackgroundService:
                 result = self._client.images.generate(
                     model=self._image_model,
                     prompt=prompt,
-                    size=size,
+                    size=size_arg,
                 )
 
                 # Try to extract a base64 payload or a downloadable URL from common response shapes
@@ -1103,3 +1322,4 @@ class AIBackgroundService:
             return True
         except Exception as fe:
             self._logger.error(f"Failed to apply fallback image: {fe}", exc_info=True)
+            return False

@@ -5,9 +5,6 @@ import numpy as np
 from tflite_runtime.interpreter import Interpreter
 from typing import List, Tuple, Final
 
-import sys
-
-sys.path.append("..")
 from logger import Logger
 
 

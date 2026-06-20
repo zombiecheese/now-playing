@@ -59,7 +59,7 @@ fi
 
 echo "==> The web portal will initialize the SQLite settings store on first run."
 
-echo "==> Setting up the now-playing systemd service..."
+echo "==> Setting up the now-playing systemd services..."
 if [ -f "/etc/systemd/system/now-playing.service" ]; then
     echo "Removing old now-playing systemd service..."
     sudo systemctl stop now-playing
@@ -68,15 +68,37 @@ if [ -f "/etc/systemd/system/now-playing.service" ]; then
     sudo systemctl daemon-reload
     echo "✔ Old now-playing systemd service removed."
 fi
+if [ -f "/etc/systemd/system/now-playing-web.service" ]; then
+    echo "Removing old now-playing-web systemd service..."
+    sudo systemctl stop now-playing-web
+    sudo systemctl disable now-playing-web
+    sudo rm -f /etc/systemd/system/now-playing-web.service
+    sudo systemctl daemon-reload
+    echo "✔ Old now-playing-web systemd service removed."
+fi
 sudo cp "${install_path}/now-playing.service" /etc/systemd/system/
+sudo cp "${install_path}/now-playing-web.service" /etc/systemd/system/
 sudo sed -i -e "/\[Service\]/a ExecStart=${install_path}/venv/bin/python3 ${install_path}/src/now_playing.py" /etc/systemd/system/now-playing.service
 sudo sed -i -e "/ExecStart/a WorkingDirectory=${install_path}" /etc/systemd/system/now-playing.service
 sudo sed -i -e "/RestartSec/a User=$(id -u)" /etc/systemd/system/now-playing.service
 sudo sed -i -e "/User/a Group=$(id -g)" /etc/systemd/system/now-playing.service
 
+sudo sed -i -e "/\[Service\]/a ExecStart=${install_path}/venv/bin/python3 ${install_path}/src/config_web_interface.py --host 0.0.0.0 --port 8088" /etc/systemd/system/now-playing-web.service
+sudo sed -i -e "/ExecStart/a WorkingDirectory=${install_path}" /etc/systemd/system/now-playing-web.service
+sudo sed -i -e "/RestartSec/a User=$(id -u)" /etc/systemd/system/now-playing-web.service
+sudo sed -i -e "/User/a Group=$(id -g)" /etc/systemd/system/now-playing-web.service
+
+SYSTEMCTL_BIN=$(command -v systemctl)
+SUDOERS_FILE="/etc/sudoers.d/now-playing-web-restart"
+echo "$(whoami) ALL=(root) NOPASSWD: ${SYSTEMCTL_BIN} restart now-playing.service, ${SYSTEMCTL_BIN} is-active now-playing.service" | sudo tee "${SUDOERS_FILE}" >/dev/null
+sudo chmod 0440 "${SUDOERS_FILE}"
+sudo visudo -cf "${SUDOERS_FILE}" >/dev/null && echo "✔ Sudoers permission configured for web-triggered app restarts."
+
 sudo systemctl daemon-reload
 sudo systemctl start now-playing
 sudo systemctl enable now-playing
-echo "✔ now-playing systemd service installed and started."
+sudo systemctl start now-playing-web
+sudo systemctl enable now-playing-web
+echo "✔ now-playing and now-playing-web systemd services installed and started."
 
 echo "🎉 Setup is complete! Your now-playing display is configured."

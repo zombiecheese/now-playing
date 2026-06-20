@@ -4,8 +4,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from spotipy.cache_handler import CacheHandler
-
 try:
     import yaml  # type: ignore
 except Exception:  # pragma: no cover - optional legacy import support
@@ -18,7 +16,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATABASE_PATH = PROJECT_ROOT / "config" / "now_playing.db"
 LEGACY_CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 LEGACY_TOGGLE_STATE_PATH = PROJECT_ROOT / "config" / "toggle_state.json"
-SPOTIFY_AUTH_TOKEN_DOCUMENT = "spotify_auth_token"
 WEATHER_CACHE_DOCUMENT = "weather_cache"
 DEFAULT_BACKUP_MIN_INTERVAL_SECONDS = 300
 DEFAULT_BACKUP_RETENTION_COUNT = 48
@@ -70,10 +67,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "background_refresh_seconds": 3600,
         "timezone": "Australia/Melbourne",
     },
-    "spotify": {
-        "client_id": "",
-        "client_secret": "",
-    },
     "orchestrator": {
         "debounce_seconds": 30,
         "cache_ttl_seconds": 86400,
@@ -91,6 +84,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "openai": {
         "api_key": "",
+        "provider": "openai",
+        "pixazo_model": "flux-schnell",
+        "pixazo_api_key": "",
         "prompt_style": "80s anime",
         "model": "gpt-image-1-mini",
     },
@@ -357,29 +353,6 @@ class SettingsStore(metaclass=SingletonMeta):
                     )
             connection.commit()
 
-    def load_spotify_auth_token(self) -> Optional[Dict[str, Any]]:
-        row = self._read_document_row(SPOTIFY_AUTH_TOKEN_DOCUMENT)
-        if row is None:
-            return None
-
-        try:
-            payload = json.loads(row["payload"])
-        except Exception:
-            return None
-
-        return payload if isinstance(payload, dict) else None
-
-    def save_spotify_auth_token(self, token_info: Dict[str, Any]) -> None:
-        if not isinstance(token_info, dict):
-            raise ValueError("Spotify auth token payload must be a dictionary.")
-        self._write_document(SPOTIFY_AUTH_TOKEN_DOCUMENT, token_info)
-
-    def spotify_auth_token_updated_at(self) -> Optional[str]:
-        row = self._read_document_row(SPOTIFY_AUTH_TOKEN_DOCUMENT)
-        if row is None:
-            return None
-        return str(row["updated_at"])
-
     def load_weather_cache(self) -> Optional[Dict[str, Any]]:
         row = self._read_document_row(WEATHER_CACHE_DOCUMENT)
         if row is None:
@@ -416,14 +389,3 @@ class SettingsStore(metaclass=SingletonMeta):
                 "oldest_updated_at": oldest,
                 "newest_updated_at": newest,
             }
-
-
-class SpotifyDbCacheHandler(CacheHandler):
-    def __init__(self, settings_store: Optional[SettingsStore] = None) -> None:
-        self._settings_store = settings_store or SettingsStore()
-
-    def get_cached_token(self) -> Optional[Dict[str, Any]]:
-        return self._settings_store.load_spotify_auth_token()
-
-    def save_token_to_cache(self, token_info: Dict[str, Any]) -> None:
-        self._settings_store.save_spotify_auth_token(token_info)

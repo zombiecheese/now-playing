@@ -14,20 +14,32 @@ env/
 .pytest_cache/
 
 # IDE/local editor state
+.vscode/
 .vscode/settings.json
 
 # Runtime outputs
 log/
 *.log
 debug_audio/
+tmp_portal_script.js
+tmp_*.py
 
 # Local runtime/state data
 config/*
+config/config.yaml
+config/fallback_uploads/
+config/test_ai_preview.png
 config/now_playing.db
 config/now_playing.db-*
+config/now_playing.db-shm
+config/now_playing.db-wal
 config/backups/
 config/current_display_preview.png
 config/toggle_state.json
+
+# Environment files
+.env
+.env.*
 
 # OS noise
 .DS_Store

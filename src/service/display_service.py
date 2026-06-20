@@ -15,14 +15,6 @@ from service.song_identify_service import SongInfo
 from inky.auto import auto
 from inky.inky_uc8159 import CLEAN
 
-# --- Optional: Spotify artist image fallback ---
-try:
-    import spotipy
-    from spotipy.oauth2 import SpotifyClientCredentials
-except Exception:
-    spotipy = None
-    SpotifyClientCredentials = None
-
 
 class DisplayService:
     """
@@ -147,21 +139,6 @@ class DisplayService:
         # Font metrics cache: {font_id: {"height": int, "ascent": int, "descent": int}}
         self._font_metrics_cache: dict[int, dict[str, int]] = {}
 
-        # Optional Spotify client credentials (for artist image lookup)
-        scfg = self._config.get("spotify", {})
-        self._spotify_id = scfg.get("client_id")
-        self._spotify_secret = scfg.get("client_secret")
-        self._spotify = None
-        if spotipy and self._spotify_id and self._spotify_secret:
-            try:
-                self._spotify = spotipy.Spotify(
-                    auth_manager=SpotifyClientCredentials(
-                        client_id=self._spotify_id, client_secret=self._spotify_secret
-                    )
-                )
-            except Exception as e:
-                self._logger.warning(f"Spotify client init failed: {e}")
-
     # ---------------------------------------------------------------------
     # Public API
     # ---------------------------------------------------------------------
@@ -218,21 +195,13 @@ class DisplayService:
         Render 'playing' screen: backdrop (artist or blurred album), album cover,
         title (song), subtitle (artist), and meta (album + year).
         """
-        # Album art with guard + fallback to artist image, then black background
+        # Album art with fallback to black background
         album_cover_image: Optional[Image.Image] = self._fetch_image(getattr(song_info, "album_art", None))
-        
-        # If no album art, try to get artist image as fallback
-        artist_image_for_cover = None
-        if not album_cover_image:
-            artist_image_for_cover = self._get_artist_backdrop_image(song_info)
-            if artist_image_for_cover:
-                album_cover_image = artist_image_for_cover
-                self._logger.info("Using artist image as album art fallback")
-        
+
         # Final fallback to black background
         if not album_cover_image:
             album_cover_image = self._make_fallback_background().convert("RGBA")
-            self._logger.info("No album art or artist image found, using black background")
+            self._logger.info("No album art found, using black background")
 
         # Build meta line (album (year) | album | year)
         album_meta = ""
@@ -242,17 +211,12 @@ class DisplayService:
             else:
                 album_meta = (song_info.album or "") or (song_info.release_year or "")
 
-        # Try artist image as backdrop; fall back to album blurred/darkened
-        # (Don't use the same artist image as backdrop if we already used it as cover)
-        artist_backdrop_img = None if artist_image_for_cover else self._get_artist_backdrop_image(song_info)
         display_image = self._generate_display_image(
             base_image=album_cover_image,
             title=song_info.title or "",
             subtitle=song_info.artist or "",
             mode="playing",
-            
             meta=album_meta,
-            artist_backdrop=artist_backdrop_img,
         )
         self._show_image_on_display(display_image, show_ai_dot=False)
 
@@ -266,7 +230,9 @@ class DisplayService:
         chosen_path = fallback_image_path or self._weather_bg_path
         if chosen_path:
             try:
-                bg_image = Image.open(chosen_path).convert("RGBA")
+                # Align local file loading behavior with fetched images so EXIF
+                # orientation/mirroring tags are honored before rendering.
+                bg_image = ImageOps.exif_transpose(Image.open(chosen_path)).convert("RGBA")
             except Exception as e:
                 self._logger.error(
                     f"Failed to load weather background '{chosen_path}': {e}"
@@ -985,18 +951,18 @@ class DisplayService:
     def _detect_cjk_language(text: str) -> str:
         """
         Detect which CJK language is predominant in the text.
-        Returns: 'ja' (Japanese), 'ko' (Korean), 'zh-Hans' (Simplified Chinese),
-                 'zh-Hant' (Traditional Chinese), or 'ja' as default.
+        Returns: 'ja' (Japanese), 'ko' (Korean), or 'zh-Hant' (Traditional Chinese).
+        Defaults to 'ja' when no language-specific marker is detected.
         """
         if not text:
             return "ja"
-        
+
         # Count language-specific characters
         hiragana_count = 0
         katakana_count = 0
         hangul_count = 0
         bopomofo_count = 0
-        
+
         for ch in text:
             code = ord(ch)
             if 0x3040 <= code <= 0x309F:  # Hiragana
@@ -1005,29 +971,16 @@ class DisplayService:
                 katakana_count += 1
             elif 0xAC00 <= code <= 0xD7AF or 0x1100 <= code <= 0x11FF or 0x3130 <= code <= 0x318F:  # Hangul
                 hangul_count += 1
-            elif 0x3100 <= code <= 0x312F or 0x31A0 <= code <= 0x31BF:  # Bopomofo (Traditional Chinese phonetic)
+            elif 0x3100 <= code <= 0x312F or 0x31A0 <= code <= 0x31BF:  # Bopomofo
                 bopomofo_count += 1
-        
-        # Korean: has Hangul
+
         if hangul_count > 0:
             return "ko"
-        
-        # Japanese: has Hiragana or Katakana
         if hiragana_count > 0 or katakana_count > 0:
             return "ja"
-        
-        # Traditional Chinese: has Bopomofo
         if bopomofo_count > 0:
             return "zh-Hant"
-        
-        # For pure Kanji/Hanzi without language-specific markers:
-        # Default to Simplified Chinese if no indicators, but this is a guess
-        # In practice, Japanese is most common in music contexts
-        cjk_count = sum(1 for ch in text if DisplayService._is_cjk(ch))
-        if cjk_count > 0:
-            # Default to Japanese as it's most common in music/media
-            return "ja"
-        
+
         return "ja"
 
     # ---------------------------------------------------------------------
@@ -1042,24 +995,17 @@ class DisplayService:
             if show_ai_dot:
                 try:
                     draw = ImageDraw.Draw(image)
-                    # Margins scale with aspect ratio and orientation
+                    # Draw in final hardware coordinates so margins are interpreted consistently.
                     w, h = image.size
                     short = min(w, h)
-                    # Get current orientation from the shared settings store
-                    runtime_orientation = self._get_runtime_orientation()
-                    # Apply margin scaling based on orientation
-                    if runtime_orientation == "portrait":
-                        margin_x = int(self._ai_dot_margin_y_px)  # Swap for portrait
-                        margin_y = int(self._ai_dot_margin_x_px)
-                    else:
-                        margin_x = int(self._ai_dot_margin_x_px)
-                        margin_y = int(self._ai_dot_margin_y_px)
+                    margin_x, margin_y = self._get_runtime_ai_dot_margins()
 
                     # Radius scales with shorter edge to remain consistent visually
                     radius = max(10, short // 50)
 
-                    x0 = margin_x
-                    y0 = margin_y
+                    # Keep the full circle on-screen even if margins are set too large.
+                    x0 = max(0, min(margin_x, w - (radius * 2)))
+                    y0 = max(0, min(margin_y, h - (radius * 2)))
                     x1 = x0 + (radius * 2)
                     y1 = y0 + (radius * 2)
                     draw.ellipse((x0, y0, x1, y1), fill=(255, 0, 0))
@@ -1099,41 +1045,21 @@ class DisplayService:
             pass
         return self._orientation
 
-    # ---------------------------------------------------------------------
-    # Artist backdrop helpers
-    # ---------------------------------------------------------------------
-
-    def _get_artist_backdrop_image(self, song_info: SongInfo) -> Optional[Image.Image]:
+    def _get_runtime_ai_dot_margins(self) -> Tuple[int, int]:
         """
-        Try Spotify artist image by name; returns RGBA PIL Image or None.
-        If Spotify creds are missing/unavailable, returns None.
+        Read AI-dot margins from the shared settings database so admin changes
+        are reflected without requiring a process restart.
         """
-        if not (self._spotify and song_info and (song_info.artist or "")):
-            return None
         try:
-            results = self._spotify.search(
-                q=f'artist:"{song_info.artist}"', type="artist", limit=1
-            )
-            artists = results.get("artists", {}).get("items", [])
-            if not artists:
-                return None
+            from settings_store import SettingsStore
 
-            images = artists[0].get("images", [])
-            if not images:
-                return None
-
-            url = images[0].get("url")
-            if not url:
-                return None
-
-            resp = self._http.get(url, timeout=6.0)
-            resp.raise_for_status()
-            img = Image.open(BytesIO(resp.content)).convert("RGBA")
-            img = ImageOps.exif_transpose(img)  # normalize orientation
-            return img
-        except Exception as e:
-            self._logger.debug(f"No Spotify artist image: {e}")
-            return None
+            cfg = SettingsStore().load_config()
+            dcfg = cfg.get("display", {}) if isinstance(cfg.get("display", {}), dict) else {}
+            margin_x = int(dcfg.get("ai_dot_margin_x_px", self._ai_dot_margin_x_px))
+            margin_y = int(dcfg.get("ai_dot_margin_y_px", self._ai_dot_margin_y_px))
+            return max(0, margin_x), max(0, margin_y)
+        except Exception:
+            return max(0, int(self._ai_dot_margin_x_px)), max(0, int(self._ai_dot_margin_y_px))
 
     # ---------------------------------------------------------------------
     # Utilities
